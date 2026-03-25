@@ -10,6 +10,11 @@ module Kafka.Internal.OffsetFetch.Response
   , parseOffsetFetchResponse
   ) where
 
+import Control.Concurrent.STM (TVar)
+import Data.Int (Int16, Int32, Int64)
+import Data.Primitive.ByteArray (ByteArray)
+import System.IO (Handle)
+
 import Kafka.Internal.Combinator
 import Kafka.Common
 import Kafka.Internal.Response

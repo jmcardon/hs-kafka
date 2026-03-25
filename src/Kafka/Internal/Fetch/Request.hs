@@ -1,14 +1,15 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Kafka.Internal.Fetch.Request
   ( fetchRequest
   , sessionlessFetchRequest
   ) where
 
-import Data.Primitive.Unlifted.Array
+import qualified Data.ByteString.Lazy as BSL
+import Data.Int (Int8, Int16, Int32, Int64)
 
 import Kafka.Common
 import Kafka.Internal.Writer
-
-import qualified String.Ascii as S
 
 fetchApiVersion :: Int16
 fetchApiVersion = 10
@@ -29,7 +30,7 @@ sessionlessFetchRequest ::
   -> TopicName
   -> [PartitionOffset]
   -> Int32
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
 sessionlessFetchRequest = fetchRequest 0 (-1)
 
 defaultReplicaId :: Int32
@@ -51,47 +52,33 @@ fetchRequest ::
   -> TopicName
   -> [PartitionOffset]
   -> Int32
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
 fetchRequest fetchSessionId fetchSessionEpoch timeout topic partitions maxBytes =
-  let
-    minimumRequestSize = 49
-    partitionMessageSize = 28
-    requestSize = minimumRequestSize
-      + partitionMessageSize * partitionCount
-      + topicNameSize
-      + clientIdLength
-    requestMetadata = build $
-      int32 (fromIntegral requestSize) -- size
-      -- common request headers
-      <> int16 fetchApiKey
-      <> int16 fetchApiVersion
-      <> int32 correlationId
-      <> string clientId clientIdLength
-      -- fetch request
-      <> int32 defaultReplicaId
-      <> int32 (fromIntegral timeout) -- max_wait_time
-      <> int32 defaultMinBytes
-      <> int32 maxBytes
-      <> int8 (isolationLevel ReadUncommitted)
-      <> int32 fetchSessionId
-      <> int32 fetchSessionEpoch
-      <> int32 1 -- number of following topics
+  buildRequest $
+    -- common request headers
+    int16 fetchApiKey
+    <> int16 fetchApiVersion
+    <> int32 correlationId
+    <> string clientId
+    -- fetch request
+    <> int32 defaultReplicaId
+    <> int32 (fromIntegral timeout) -- max_wait_time
+    <> int32 defaultMinBytes
+    <> int32 maxBytes
+    <> int8 (isolationLevel ReadUncommitted)
+    <> int32 fetchSessionId
+    <> int32 fetchSessionEpoch
+    <> int32 1 -- number of following topics
 
-      <> topicName topic
-      <> int32 (fromIntegral partitionCount) -- number of following partitions
-      <> foldMap
-          (\p -> int32 (partitionIndex p)
-            <> int32 defaultCurrentLeaderEpoch
-            <> int64 (partitionOffset p)
-            <> int64 defaultLogStartOffset
-            <> int32 maxBytes -- partition_max_bytes
-          ) partitions
-      <> int32 0
-  in
-    runUnliftedArray $ do
-      arr <- newUnliftedArray 1 mempty
-      writeUnliftedArray arr 0 requestMetadata
-      pure arr
+    <> topicName topic
+    <> int32 (fromIntegral partitionCount) -- number of following partitions
+    <> foldMap
+        (\p -> int32 (partitionIndex p)
+          <> int32 defaultCurrentLeaderEpoch
+          <> int64 (partitionOffset p)
+          <> int64 defaultLogStartOffset
+          <> int32 maxBytes -- partition_max_bytes
+        ) partitions
+    <> int32 0
   where
-    topicNameSize = S.length (coerce topic)
     partitionCount = length partitions

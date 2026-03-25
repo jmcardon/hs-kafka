@@ -19,9 +19,14 @@ module Kafka.Internal.Fetch.Response
   , partitionLastSeenOffset
   ) where
 
+import Control.Concurrent.STM (TVar)
 import Control.Monad ((<=<))
-import Data.List (find,intercalate)
+import Data.Int (Int8, Int16, Int32, Int64)
+import Data.List (find, intercalate)
 import Data.List.NonEmpty (nonEmpty)
+import Data.Maybe (mapMaybe)
+import Data.Primitive.ByteArray (ByteArray)
+import System.IO (Handle)
 
 import qualified Data.Foldable as F
 

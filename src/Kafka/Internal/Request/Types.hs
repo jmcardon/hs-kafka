@@ -4,7 +4,13 @@
 
 module Kafka.Internal.Request.Types where
 
-import Data.Primitive.Unlifted.Array
+import Data.ByteString (ByteString)
+import Data.Int (Int8, Int32)
+import Data.IORef (IORef)
+import Data.Primitive.ByteArray (ByteArray)
+import Data.Primitive.Unlifted.Array (UnliftedArray)
+import System.IO (Handle)
+
 import Kafka.Common
 import Kafka.Internal.ShowDebug
 

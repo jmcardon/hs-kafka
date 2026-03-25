@@ -1,13 +1,18 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Kafka.Internal.LeaveGroup.Request
   ( leaveGroupRequest
   ) where
 
-import Data.Primitive.Unlifted.Array
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Lazy as BSL
+import Data.Bytes.Types (Bytes(Bytes))
+import qualified Data.Bytes
+import Data.Int (Int16, Int32)
+import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
 
 import Kafka.Common
 import Kafka.Internal.Writer
-
-import qualified String.Ascii as S
 
 leaveGroupApiVersion :: Int16
 leaveGroupApiVersion = 2
@@ -15,26 +20,20 @@ leaveGroupApiVersion = 2
 leaveGroupApiKey :: Int16
 leaveGroupApiKey = 13
 
+baToBS :: ByteArray -> ByteString
+baToBS ba = Data.Bytes.toByteString (Bytes ba 0 (sizeofByteArray ba))
+
 leaveGroupRequest ::
      GroupMember
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
 leaveGroupRequest (GroupMember (GroupName gid) mid) =
-  let
-    groupIdLength = S.length gid
-    reqSize = build $ (int32 (fromIntegral $ sizeofByteArray req))
-    req = build $
-      int16 leaveGroupApiKey
-      <> int16 leaveGroupApiVersion
-      <> int32 correlationId
-      <> string clientId (fromIntegral clientIdLength)
-      <> string gid (fromIntegral groupIdLength)
-      <> maybe
-          (int16 0)
-          (\m -> bytearray m (sizeofByteArray m))
-          mid
-  in
-    runUnliftedArray $ do
-      arr <- newUnliftedArray 2 mempty
-      writeUnliftedArray arr 0 reqSize
-      writeUnliftedArray arr 1 req
-      pure arr
+  buildRequest $
+    int16 leaveGroupApiKey
+    <> int16 leaveGroupApiVersion
+    <> int32 correlationId
+    <> string clientId
+    <> string gid
+    <> maybe
+        (int16 0)
+        (\m -> bytearray (baToBS m))
+        mid

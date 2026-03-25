@@ -2,10 +2,13 @@ module Kafka.Internal.ShowDebug
   (ShowDebug(..)
   ) where
 
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as BS8
+import Data.Int (Int8, Int16, Int32, Int64)
 import Data.List (intercalate)
-import Kafka.Common
+import Data.Primitive.ByteArray (ByteArray)
 
-import qualified String.Ascii as S
+import Kafka.Common
 
 class ShowDebug a where
   showDebug :: a -> String
@@ -33,10 +36,10 @@ instance ShowDebug a => ShowDebug (Maybe a) where
   showDebug (Just x) = "Just " <> showDebug x
 
 instance ShowDebug ByteArray where
-  showDebug = show . S.fromByteArray
+  showDebug = show
 
-instance ShowDebug S.String where
-  showDebug b = S.asByteArray b show
+instance ShowDebug ByteString where
+  showDebug = BS8.unpack
 
 instance ShowDebug GroupName where
   showDebug (GroupName gid) = "GroupName(" <> showDebug gid <> ")"

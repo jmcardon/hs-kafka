@@ -1,15 +1,20 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Kafka.Internal.OffsetCommit.Request
   ( offsetCommitRequest
   ) where
 
-import Data.Primitive.Unlifted.Array
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Lazy as BSL
+import Data.Bytes.Types (Bytes(Bytes))
+import qualified Data.Bytes
+import Data.Int (Int16, Int32, Int64)
+import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
 
 import Kafka.Common
 import Kafka.Internal.Writer
 
-import qualified String.Ascii as S
-
-serializePartition :: PartitionOffset -> Builder
+serializePartition :: PartitionOffset -> BuildR
 serializePartition a =
   int32 (partitionIndex a)
   <> int64 (partitionOffset a)
@@ -22,39 +27,32 @@ offsetCommitApiKey = 8
 offsetCommitApiVersion :: Int16
 offsetCommitApiVersion = 6
 
+baToBS :: ByteArray -> ByteString
+baToBS ba = Data.Bytes.toByteString (Bytes ba 0 (sizeofByteArray ba))
+
 offsetCommitRequest ::
      TopicName
   -> [PartitionOffset]
   -> GroupMember
   -> GenerationId
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
 offsetCommitRequest topic offs groupMember generationId =
   let
     GroupMember (GroupName gid) mid = groupMember
     GenerationId genId = generationId
-    reqSize = build (int32 (size32 req))
-    req =
-      build $
-        int16 offsetCommitApiKey
-        <> int16 offsetCommitApiVersion
-        <> int32 correlationId
-        <> string clientId clientIdLength
-        <> string gid (S.length gid)
-        <> int32 genId
-        <> maybe
-            (int16 0)
-            (\m -> bytearray m (sizeofByteArray m))
-            mid
-        <> int32 1 -- 1 topic
-        <> topicName topic
-        <> int32 (fromIntegral $ length offs)
-        <> foldl'
-            (\acc e -> acc <> serializePartition e)
-            mempty
-            offs
   in
-    runUnliftedArray $ do
-      arr <- newUnliftedArray 2 mempty
-      writeUnliftedArray arr 0 reqSize
-      writeUnliftedArray arr 1 req
-      pure arr
+    buildRequest $
+      int16 offsetCommitApiKey
+      <> int16 offsetCommitApiVersion
+      <> int32 correlationId
+      <> string clientId
+      <> string gid
+      <> int32 genId
+      <> maybe
+          (int16 0)
+          (\m -> bytearray (baToBS m))
+          mid
+      <> int32 1 -- 1 topic
+      <> topicName topic
+      <> int32 (fromIntegral $ length offs)
+      <> foldMap serializePartition offs

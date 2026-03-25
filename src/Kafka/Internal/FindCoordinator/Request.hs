@@ -1,12 +1,16 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
 
 module Kafka.Internal.FindCoordinator.Request
   ( findCoordinatorRequest
   ) where
 
-import Data.Primitive.Unlifted.Array
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Lazy as BSL
+import Data.Bytes.Types (Bytes(Bytes))
+import qualified Data.Bytes
+import Data.Int (Int8, Int16, Int32)
+import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
 
 import Kafka.Common
 import Kafka.Internal.Writer
@@ -17,26 +21,18 @@ findCoordinatorApiVersion = 2
 findCoordinatorApiKey :: Int16
 findCoordinatorApiKey = 10
 
+baToBS :: ByteArray -> ByteString
+baToBS ba = Data.Bytes.toByteString (Bytes ba 0 (sizeofByteArray ba))
+
 findCoordinatorRequest ::
      ByteArray -- key, a.k.a. group name
   -> Int8
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
 findCoordinatorRequest !key !keyType =
-  let
-    keyLength = sizeofByteArray key
-    reqSize = build $
-      int32 (fromIntegral $ sizeofByteArray req)
-    req = build $
-      int16 findCoordinatorApiKey
-      <> int16 findCoordinatorApiVersion
-      <> int32 correlationId
-      <> string clientId (fromIntegral clientIdLength)
-      <> bytearray key (fromIntegral keyLength)
-      <> int8 keyType
-  in
-    runUnliftedArray $ do
-      arr <- newUnliftedArray 2 mempty
-      writeUnliftedArray arr 0 reqSize
-      writeUnliftedArray arr 1 req
-      pure arr
-
+  buildRequest $
+    int16 findCoordinatorApiKey
+    <> int16 findCoordinatorApiVersion
+    <> int32 correlationId
+    <> string clientId
+    <> bytearray (baToBS key)
+    <> int8 keyType

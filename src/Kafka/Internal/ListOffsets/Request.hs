@@ -1,13 +1,14 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Kafka.Internal.ListOffsets.Request
   ( listOffsetsRequest
   ) where
 
-import Data.Primitive.Unlifted.Array
+import qualified Data.ByteString.Lazy as BSL
+import Data.Int (Int8, Int16, Int32, Int64)
 
 import Kafka.Common
 import Kafka.Internal.Writer
-
-import qualified String.Ascii as S
 
 listOffsetsApiVersion :: Int16
 listOffsetsApiVersion = 5
@@ -41,43 +42,25 @@ listOffsetsRequest ::
      TopicName
   -> [Int32]
   -> KafkaTimestamp
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
 listOffsetsRequest topic partitions timestamp =
-  let
-    minimumReqSize = 25
-    partitionMessageSize = 16
-    reqSize = fromIntegral $
-        minimumReqSize
-      + clientIdLength
-      + topicNameSize
-      + partitionMessageSize * partitionCount
-    req = build $
-      int32 reqSize
-      -- common request headers
-      <> int16 listOffsetsApiKey
-      <> int16 listOffsetsApiVersion
-      <> int32 correlationId
-      <> string clientId clientIdLength
-      -- listoffsets request
-      <> int32 defaultReplicaId
-      <> int8 defaultIsolationLevel
-      <> int32 1 -- number of following topics
+  buildRequest $
+    -- common request headers
+    int16 listOffsetsApiKey
+    <> int16 listOffsetsApiVersion
+    <> int32 correlationId
+    <> string clientId
+    -- listoffsets request
+    <> int32 defaultReplicaId
+    <> int8 defaultIsolationLevel
+    <> int32 1 -- number of following topics
 
-      <> topicName topic
-      <> array
-          ( fmap
-            (\p -> int32 p
-              <> int32 defaultCurrentLeaderEpoch
-              <> int64 (kafkaTimestamp timestamp)
-            )
-            partitions
+    <> topicName topic
+    <> array
+        ( fmap
+          (\p -> int32 p
+            <> int32 defaultCurrentLeaderEpoch
+            <> int64 (kafkaTimestamp timestamp)
           )
-          (fromIntegral partitionCount)
-  in
-    runUnliftedArray $ do
-      arr <- newUnliftedArray 1 mempty
-      writeUnliftedArray arr 0 req
-      pure arr
-  where
-    topicNameSize = S.length (coerce topic)
-    partitionCount = length partitions
+          partitions
+        )

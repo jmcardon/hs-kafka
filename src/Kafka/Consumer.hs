@@ -30,14 +30,24 @@ module Kafka.Consumer
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, registerDelay)
 import Control.Monad hiding (join)
 import Control.Monad.Except hiding (join)
 import Control.Monad.Reader hiding (join)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import Data.Coerce (coerce)
 import Data.Foldable
+import Data.Int (Int16, Int32, Int64)
 import Data.IntMap (IntMap)
+import Data.IORef (IORef, newIORef)
 import qualified Data.List as List
 import Data.Maybe
-import Socket.Stream.IPv4 (Peer)
+import Data.Primitive.ByteArray (ByteArray, byteArrayFromListN)
+import Data.Word (Word8)
+import Network.Socket (HostName, ServiceName)
+import System.IO (Handle)
 
 import qualified Data.IntMap as IM
 
@@ -62,7 +72,15 @@ import qualified Kafka.Internal.OffsetCommit.Response as C
 import qualified Kafka.Internal.OffsetFetch.Response as O
 import qualified Kafka.Internal.SyncGroup.Response as S
 
-import qualified String.Ascii as Str
+-- | Whether or not consumption has been interrupted.
+data Interruptedness
+  = Interrupted
+  | Uninterrupted
+  deriving (Eq, Show)
+
+-- | Convert a strict ByteString to a ByteArray (one copy).
+bsToByteArray :: ByteString -> ByteArray
+bsToByteArray bs = byteArrayFromListN (BS.length bs) (BS.unpack bs :: [Word8])
 
 -- | This module provides a high-level interface to the Kafka API for
 -- consumers by wrapping the low-level request and response type modules.
@@ -218,12 +236,13 @@ updateOffsets name current r =
     current
 
 withConsumer :: ()
-  => Peer
+  => HostName
+  -> ServiceName
   -> ConsumerSettings
   -> (TVar ConsumerState -> IO a)
   -> IO (Either KafkaException a)
-withConsumer peer settings f = do
-  r <- withKafka peer $ \k -> do
+withConsumer host port settings f = do
+  r <- withKafka host port $ \k -> do
     r <- newConsumer k settings
     case r of
       Left e -> pure (Left e)
@@ -529,7 +548,7 @@ join ::
 join kafka top member@(GroupMember name@(GroupName gid) _) handle = do
   ExceptT $ findCoordinator
     kafka
-    (FindCoordinatorRequest (Str.toByteArray gid) 0)
+    (FindCoordinatorRequest (bsToByteArray gid) 0)
     handle
   wait <- liftIO (registerDelay joinTimeout)
   -- Ignoring the response from FindCoordinator. Probably not

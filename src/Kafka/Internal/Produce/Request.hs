@@ -1,29 +1,26 @@
-{-# language
-    BangPatterns
-  , DataKinds
-  , DeriveFunctor
-  , FlexibleContexts
-  , GeneralizedNewtypeDeriving
-  , MultiParamTypeClasses
-  , OverloadedStrings
-  , PolyKinds
-  , RankNTypes
-  , TypeFamilies
-  , UnboxedTuples
-  , UndecidableInstances
-  #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Kafka.Internal.Produce.Request
   ( produceRequest
   ) where
 
-import Data.Bytes.Types
+import Control.Monad.ST (runST)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BSL
+import Data.Bytes.Types (Bytes(Bytes))
+import qualified Data.Bytes
+import Data.Coerce (coerce)
 import Data.Foldable
-import Data.Primitive.Slice (UnliftedVector(UnliftedVector))
+import Data.Int (Int8, Int16, Int32, Int64)
+import Data.Primitive.ByteArray (ByteArray, byteArrayFromList, newByteArray, sizeofByteArray,
+  unsafeFreezeByteArray, writeByteArray)
+-- No longer using Data.Primitive.Slice; CRC is computed via fold over UnliftedArray
 import Data.Primitive.Unlifted.Array
+import Data.Word (Word8)
 
 import qualified Crc32c as CRC
-import qualified String.Ascii as S
 
 import Kafka.Common
 import Kafka.Internal.Writer
@@ -69,18 +66,17 @@ defaultBaseSequence = -1
 defaultRecordBatchAttributes :: Int16
 defaultRecordBatchAttributes = 0
 
-data Acknowledgments
-  = AckLeaderOnly
-  | NoAcknowledgments
-  | AckFullISR
+-- | Convert a ByteArray to a ByteString.
+baToBS :: ByteArray -> ByteString
+baToBS ba = Data.Bytes.toByteString (Bytes ba 0 (sizeofByteArray ba))
 
-defaultAcknowledgments :: Acknowledgments
-defaultAcknowledgments = AckLeaderOnly
+-- | Convert a ByteString to a ByteArray.
+bsToBA :: ByteString -> ByteArray
+bsToBA bstr = byteArrayFromList (BS.unpack bstr)
 
-acks :: Acknowledgments -> Int16
-acks AckLeaderOnly = 1
-acks NoAcknowledgments = 0
-acks AckFullISR = -1
+-- | Materialize a BuildR to a ByteArray (for CRC computation).
+buildToBA :: BuildR -> ByteArray
+buildToBA b = bsToBA (BSL.toStrict (toLazyByteString b))
 
 makeRecordMetadata :: Int -> ByteArray -> ByteArray
 makeRecordMetadata index content =
@@ -107,23 +103,28 @@ produceRequestRecordBatchMetadata ::
   -> ByteArray
 produceRequestRecordBatchMetadata payloadsSectionChunks payloadCount payloadsSectionSize =
   let
-    crc =
-      CRC.chunks
+    crc = crcOverChunks
         (CRC.bytes 0 (Bytes postCrc 0 postCrcLength))
-        (UnliftedVector payloadsSectionChunks 0 (3*payloadCount))
+        payloadsSectionChunks 0 (3*payloadCount)
+    crcOverChunks !acc _arr !ix !end
+      | ix >= end = acc
+      | otherwise =
+          let ba = indexUnliftedArray payloadsSectionChunks ix
+          in crcOverChunks (CRC.bytes acc (Bytes ba 0 (sizeofByteArray ba)))
+               payloadsSectionChunks (ix + 1) end
     batchLength = fromIntegral $
         preCrcLength
       + postCrcLength
       + payloadsSectionSize
     preCrcLength = 9
-    preCrc = build $
+    preCrc = buildToBA $
       int64 defaultBaseOffset
       <> int32 batchLength
       <> int32 defaultPartitionLeaderEpoch
       <> int8 magic
       <> int32 (fromIntegral crc)
     postCrcLength = 40
-    postCrc = build $
+    postCrc = buildToBA $
       int16 defaultRecordBatchAttributes
       <> int32 (fromIntegral (payloadCount - 1))
       <> int64 defaultFirstTimestamp
@@ -136,19 +137,21 @@ produceRequestRecordBatchMetadata payloadsSectionChunks payloadCount payloadsSec
     preCrc <> postCrc
 
 makeRequestMetadata :: ()
-  => Int -- ^ record batch section size
+  => Int16 -- ^ acks value
+  -> ByteString -- ^ client ID
+  -> Int -- ^ record batch section size
   -> Int -- ^ timeout (microseconds)
   -> TopicName -- ^ topic name
   -> Int32 -- ^ partition
   -> ByteArray
-makeRequestMetadata !rbss !timeout tn !partition = build $
+makeRequestMetadata !acksVal !cid !rbss !timeout tn !partition = buildToBA $
   int32 size
   <> int16 produceApiKey
   <> int16 produceApiVersion
   <> int32 correlationId
-  <> string clientId clientIdLength
+  <> string cid
   <> int16 (-1) -- transactional_id length
-  <> int16 (acks defaultAcknowledgments) -- acks
+  <> int16 acksVal -- acks
   <> int32 (fromIntegral timeout) -- timeout in ms
   <> int32 1 -- following array length
   <> topicName tn -- topic_data topic
@@ -157,20 +160,23 @@ makeRequestMetadata !rbss !timeout tn !partition = build $
   <> int32 (fromIntegral rbss) -- record_set length
   where
     minimumSize = 36
-    topicNameSize = S.length (coerce tn)
+    cidLen = BS.length cid
+    topicNameSize = BS.length (coerce tn :: ByteString)
     size = fromIntegral $ 0
       + minimumSize
-      + clientIdLength
+      + cidLen
       + topicNameSize
       + rbss
 
 produceRequest ::
-     Int
+     Int16 -- ^ acks
+  -> ByteString -- ^ client ID
+  -> Int -- ^ timeout (ms)
   -> TopicName
   -> Int32
   -> UnliftedArray ByteArray
-  -> UnliftedArray ByteArray
-produceRequest timeout topic partition payloads =
+  -> BSL.ByteString
+produceRequest acksVal cid timeout topic partition payloads =
   let
     payloadCount = sizeofUnliftedArray payloads
     zero = runST $ do
@@ -181,6 +187,8 @@ produceRequest timeout topic partition payloads =
       + sumSizes payloadsSectionChunks
       + sizeofByteArray recordBatchMetadata
     requestMetadata = makeRequestMetadata
+      acksVal
+      cid
       recordBatchSectionSize
       timeout
       topic
@@ -199,9 +207,18 @@ produceRequest timeout topic partition payloads =
           writeUnliftedArray arr (i * 3 + 2) zero)
         payloads
       pure arr
-  in runUnliftedArray $ do
-    arr <- newUnliftedArray (3 * payloadCount + 2) zero
-    writeUnliftedArray arr 0 requestMetadata
-    writeUnliftedArray arr 1 recordBatchMetadata
-    copyUnliftedArray arr 2 payloadsSectionChunks 0 (3 * payloadCount)
-    pure arr
+    finalArr = runUnliftedArray $ do
+      arr <- newUnliftedArray (3 * payloadCount + 2) zero
+      writeUnliftedArray arr 0 requestMetadata
+      writeUnliftedArray arr 1 recordBatchMetadata
+      copyUnliftedArray arr 2 payloadsSectionChunks 0 (3 * payloadCount)
+      pure arr
+  in gatherToLBS finalArr
+
+-- | Gather an UnliftedArray ByteArray into a lazy ByteString.
+-- Concatenates all ByteArray chunks into a single contiguous ByteArray
+-- first (one allocation, one copy), then converts to ByteString.
+gatherToLBS :: UnliftedArray ByteArray -> BSL.ByteString
+gatherToLBS chunks =
+  let gathered = foldrUnliftedArray (<>) mempty chunks
+  in BSL.fromStrict (baToBS gathered)

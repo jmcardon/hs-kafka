@@ -8,6 +8,10 @@ module Kafka.Internal.Heartbeat.Response
   , parseHeartbeatResponse
   ) where
 
+import Control.Concurrent.STM (TVar)
+import Data.Int (Int16, Int32)
+import System.IO (Handle)
+
 import Kafka.Common
 import Kafka.Internal.Combinator
 import Kafka.Internal.Response

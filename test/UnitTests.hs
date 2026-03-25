@@ -9,14 +9,11 @@ import Data.Word
 import Test.Tasty
 import Test.Tasty.Golden
 import Test.Tasty.HUnit
-import Prelude hiding (readFile)
-import Data.ByteString (ByteString)
 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC8
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Bytes.Parser as Smith
-import qualified String.Ascii as S
 import qualified Data.IntMap as IM
 
 import Data.Bytes.Parser (Result(..))
@@ -31,6 +28,13 @@ import Kafka.Internal.Produce.Request
 import Kafka.Internal.Produce.Response
 import Kafka.Internal.Zigzag
 import qualified Kafka.Internal.Fetch.Response as Fetch
+import Kafka.Internal.ApiVersions.Response (ApiVersionsResponse(..), ApiVersionEntry(..),
+  parseApiVersionsResponse)
+import Kafka.Internal.InitProducerId.Response (InitProducerIdResponse(..),
+  parseInitProducerIdResponse)
+import Kafka.Internal.Combinator (unsignedVarInt, compactString, compactNullableString,
+  compactArray, skipTaggedFields)
+import Kafka.Internal.Writer (BuildR, toLazyByteString)
 import qualified Kafka.Internal.Writer as W
 
 main :: IO ()
@@ -40,6 +44,8 @@ unitTests :: TestTree
 unitTests = testGroup "Unit tests"
   [ zigzagTests
   , parserTests
+  , compactEncodingTests
+  , apiVersionsTests
   , responseParserTests
   , consumerTests
   ]
@@ -66,16 +72,12 @@ zigzagTests = testGroup "zigzag"
       (zigzag 150 @?= byteArrayFromList [172, 2 :: Word8])
   ]
 
-readFile :: FilePath -> IO S.String
-readFile fp = do
-  b <- B.readFile fp
-  pure (S.unsafeFromByteArray (fromByteString b))
-
-fromByteString :: ByteString -> ByteArray
+fromByteString :: B.ByteString -> ByteArray
 fromByteString = byteArrayFromList . B.unpack
 
-toByteString :: ByteArray -> ByteString
-toByteString = B.pack . foldrByteArray (:) []
+-- | Build a ByteArray from a BuildR (for test response construction).
+buildBA :: BuildR -> ByteArray
+buildBA = fromByteString . BL.toStrict . toLazyByteString
 
 parserTests :: TestTree
 parserTests = testGroup "Parsers"
@@ -100,6 +102,80 @@ parserTests = testGroup "Parsers"
   , testCase
       "parseVarint (zigzag (-1)) is (-1)"
       (Smith.parseByteArray varInt (zigzag (-1)) @?= Success (Smith.Slice 1 0 (-1)))
+  ]
+
+-- | Helper: encode with Writer, convert to ByteArray, parse with Combinator.
+roundTrip :: BuildR -> (forall s. Smith.Parser String s a) -> Either String a
+roundTrip builder parser =
+  case Smith.parseByteArray parser (buildBA builder) of
+    Smith.Failure e -> Left e
+    Smith.Success (Smith.Slice _ _ a) -> Right a
+
+compactEncodingTests :: TestTree
+compactEncodingTests = testGroup "Compact encoding (KIP-482)"
+  [ testCase "unsignedVarInt 0 round-trips" $
+      roundTrip (W.unsignedVarInt 0) unsignedVarInt @?= Right 0
+  , testCase "unsignedVarInt 127 round-trips" $
+      roundTrip (W.unsignedVarInt 127) unsignedVarInt @?= Right 127
+  , testCase "unsignedVarInt 128 round-trips" $
+      roundTrip (W.unsignedVarInt 128) unsignedVarInt @?= Right 128
+  , testCase "unsignedVarInt 300 round-trips" $
+      roundTrip (W.unsignedVarInt 300) unsignedVarInt @?= Right 300
+  , testCase "unsignedVarInt 16384 round-trips" $
+      roundTrip (W.unsignedVarInt 16384) unsignedVarInt @?= Right 16384
+  , testCase "compactString round-trips" $
+      roundTrip (W.compactString "hello") compactString @?= Right "hello"
+  , testCase "compactString empty round-trips" $
+      roundTrip (W.compactString "") compactString @?= Right ""
+  , testCase "compactNullableString null round-trips" $
+      roundTrip (W.compactNullableString Nothing) compactNullableString @?= Right Nothing
+  , testCase "compactNullableString present round-trips" $
+      roundTrip (W.compactNullableString (Just "test")) compactNullableString @?= Right (Just "test")
+  , testCase "compactArray of int32 round-trips" $
+      roundTrip
+        (W.compactArray [W.int32 10, W.int32 20, W.int32 30])
+        (compactArray (int32 ""))
+      @?= Right [10, 20, 30]
+  , testCase "compactArray empty round-trips" $
+      roundTrip
+        (W.compactArray [])
+        (compactArray (int32 ""))
+      @?= Right []
+  , testCase "taggedFields empty round-trips" $
+      roundTrip W.taggedFields skipTaggedFields @?= Right ()
+  ]
+
+apiVersionsTests :: TestTree
+apiVersionsTests = testGroup "ApiVersions + InitProducerId"
+  [ testCase "parse ApiVersionsResponse with 2 entries" $
+      let responseBytes = buildBA $
+            W.int32 0           -- correlationId
+            <> W.int16 0        -- errorCode (no error)
+            <> W.int32 2        -- array length: 2 entries
+            <> W.int16 0        -- apiKey: Produce
+            <> W.int16 0        -- minVersion
+            <> W.int16 7        -- maxVersion
+            <> W.int16 1        -- apiKey: Fetch
+            <> W.int16 0        -- minVersion
+            <> W.int16 10       -- maxVersion
+          expected = ApiVersionsResponse 0
+            [ ApiVersionEntry 0 0 7
+            , ApiVersionEntry 1 0 10
+            ]
+      in case Smith.parseByteArray parseApiVersionsResponse responseBytes of
+        Smith.Success (Smith.Slice _ _ resp) -> resp @?= expected
+        Smith.Failure e -> assertFailure ("parse failed: " ++ e)
+  , testCase "parse InitProducerIdResponse" $
+      let responseBytes = buildBA $
+            W.int32 0           -- correlationId
+            <> W.int32 0        -- throttleTimeMs
+            <> W.int16 0        -- errorCode
+            <> W.int64 12345    -- producerId
+            <> W.int16 0        -- producerEpoch
+          expected = InitProducerIdResponse 0 0 12345 0
+      in case Smith.parseByteArray parseInitProducerIdResponse responseBytes of
+        Smith.Success (Smith.Slice _ _ resp) -> resp @?= expected
+        Smith.Failure e -> assertFailure ("parse failed: " ++ e)
   ]
 
 responseParserTests :: TestTree
@@ -160,20 +236,14 @@ goldenTests = testGroup "Golden tests"
       ]
   ]
 
-toSpec :: UnliftedArray ByteArray -> BL.ByteString
-toSpec = BL.fromStrict . toByteString . unChunks
-
+-- Request modules now return BSL.ByteString, so golden tests use it directly.
 produceTest :: IO BL.ByteString
 produceTest = do
-  let payload = fromByteString $ "\"im not owned! im not owned!!\", i continue to insist as i slowlyshrink and transform into a corn cob"
+  let payload = fromByteString "\"im not owned! im not owned!!\", i continue to insist as i slowlyshrink and transform into a corn cob"
   payloads <- do
     payloads <- newUnliftedArray 1 payload
     freezeUnliftedArray payloads 0 1
-  let req = produceRequest 30000 "test" 0 payloads
-  pure (toSpec req)
-
-unChunks :: UnliftedArray ByteArray -> ByteArray
-unChunks = foldrUnliftedArray (<>) mempty
+  pure (produceRequest 1 "ruko" 30000 "test" 0 payloads)
 
 multipleProduceTest :: IO BL.ByteString
 multipleProduceTest = do
@@ -183,24 +253,19 @@ multipleProduceTest = do
         , fromByteString "it's like a dream"
         , fromByteString "i want to dream"
         ]
-  let req = produceRequest 30000 "test" 0 payloads
-  pure (toSpec req)
+  pure (produceRequest 1 "ruko" 30000 "test" 0 payloads)
 
 fetchTest :: IO BL.ByteString
-fetchTest = do
-  pure (toSpec (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0] 30000000))
+fetchTest = pure (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0] 30000000)
 
 multipleFetchTest :: IO BL.ByteString
-multipleFetchTest = do
-  pure (toSpec (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0, PartitionOffset 1 0, PartitionOffset 2 0] 30000000))
+multipleFetchTest = pure (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0, PartitionOffset 1 0, PartitionOffset 2 0] 30000000)
 
 listOffsetsTest :: [Int32] -> IO BL.ByteString
-listOffsetsTest partitions = do
-  pure (toSpec (listOffsetsRequest "test" partitions Latest))
+listOffsetsTest partitions = pure (listOffsetsRequest "test" partitions Latest)
 
 joinGroupTest :: GroupMember -> IO BL.ByteString
-joinGroupTest groupMember = do
-  pure (toSpec (joinGroupRequest "test" groupMember))
+joinGroupTest groupMember = pure (joinGroupRequest "test" groupMember)
 
 produceResponseTest :: TestTree
 produceResponseTest = testGroup "Produce"
@@ -218,10 +283,10 @@ parseProduce :: ByteArray -> Result String ProduceResponse
 parseProduce = Smith.parseByteArray parseProduceResponse
 
 oneMsgProduceResponseBytes :: ByteArray
-oneMsgProduceResponseBytes = W.build $
+oneMsgProduceResponseBytes = buildBA $
   W.int32 0
   <> W.int32 1
-  <> W.string "topic-name" 10
+  <> W.string "topic-name"
   <> W.int32 1
   <> W.int32 10
   <> W.int16 11
@@ -231,10 +296,10 @@ oneMsgProduceResponseBytes = W.build $
   <> W.int32 1
 
 twoMsgProduceResponseBytes :: ByteArray
-twoMsgProduceResponseBytes = W.build $
+twoMsgProduceResponseBytes = buildBA $
   W.int32 0
   <> W.int32 1
-  <> W.string "topic-name" 10
+  <> W.string "topic-name"
   <> W.int32 2
   <> W.int32 10
   <> W.int16 11
@@ -301,8 +366,9 @@ fetchResponseTest = testGroup "Fetch"
       "Many batches"
       "test/golden/fetch-response-parsed"
       (do
-        bytes <- readFile "test/golden/fetch-response-bytes"
-        case Smith.parseByteArray Fetch.parseFetchResponse (S.toByteArray bytes) of
+        rawBytes <- B.readFile "test/golden/fetch-response-bytes"
+        let ba = fromByteString rawBytes
+        case Smith.parseByteArray Fetch.parseFetchResponse ba of
           Failure e -> fail ("Parse failed with " <> e)
           Success (Smith.Slice _ _ res) -> pure (BL.fromStrict (BC8.pack (show res)))
       )

@@ -6,8 +6,14 @@ module Kafka.Internal.Topic
   , getPartitionCount
   ) where
 
+import Control.Concurrent.STM (registerDelay)
 import Control.Monad.Except
-import Data.List
+import Control.Monad.IO.Class (liftIO)
+import Data.Coerce (coerce)
+import Data.Int (Int32)
+import Data.IORef (newIORef)
+import Data.List (find)
+import System.IO (Handle)
 
 import Kafka.Common
 import Kafka.Internal.Response
@@ -18,7 +24,7 @@ import qualified Kafka.Internal.Metadata.Response as M
 
 makeTopic :: Kafka -> TopicName -> Maybe Handle -> IO (Either KafkaException Topic)
 makeTopic kafka topicName handle = do
-  partitionCounter <- liftIO (newIORef 0)
+  partitionCounter <- newIORef 0
   getPartitionCount kafka topicName 5000000 handle >>= \case
     Right count -> pure (Right (Topic (coerce topicName) (fromIntegral count) partitionCounter))
     Left err -> pure (Left err)

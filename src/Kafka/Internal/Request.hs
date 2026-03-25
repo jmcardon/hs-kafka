@@ -1,7 +1,5 @@
-{-# language
-    LambdaCase
-  , RecordWildCards
-  #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Kafka.Internal.Request
   ( fetch
@@ -17,9 +15,11 @@ module Kafka.Internal.Request
   , syncGroup
   ) where
 
-import Data.Primitive.Unlifted.Array
-import Socket.Stream.Uninterruptible.Bytes
-import System.IO (hPutStr, hFlush)
+import Control.Exception (try, IOException)
+import qualified Data.ByteString.Lazy as BSL
+import Data.IORef
+import qualified Network.Socket.ByteString.Lazy as NBSL
+import System.IO (Handle, hPutStr, hFlush)
 
 import Kafka.Common
 import Kafka.Internal.Fetch.Request
@@ -38,10 +38,13 @@ import Kafka.Internal.SyncGroup.Request
 
 request ::
      Kafka
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
   -> IO (Either KafkaException ())
-request kafka msg = first KafkaSendException
-  <$> sendMany (getKafka kafka) msg
+request kafka msg = do
+  result <- try (NBSL.sendAll (getSocket kafka) msg)
+  case result of
+    Left (e :: IOException) -> pure (Left (KafkaIOError (show e)))
+    Right () -> pure (Right ())
 
 logHandle :: Maybe Handle -> String -> IO ()
 logHandle handle str =
@@ -61,6 +64,8 @@ produce kafka req@ProduceRequest{..} handle = do
   let Topic topicName parts ctr = produceTopic
   p <- fromIntegral <$> readIORef ctr
   let message = produceRequest
+        1 -- acks=leader (legacy default)
+        clientId
         (produceWaitTime `div` 1000)
         topicName
         p
