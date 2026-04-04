@@ -21,12 +21,10 @@ module Kafka.Client
   , leaderBrokerFor
   ) where
 
-import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM
 import Control.Monad (forM_, unless)
-import Data.Int (Int32, Int16)
+import Data.Int (Int32)
 import Data.IntMap.Strict (IntMap)
-import Data.IORef
 import Data.Map.Strict (Map)
 import Data.Primitive.ByteArray (ByteArray)
 
@@ -38,8 +36,9 @@ import Kafka.Common
 import Kafka.Internal.Broker
 import Kafka.Internal.Config
 import Kafka.Internal.Metadata.Request (metadataRequest)
+import Kafka.Internal.Metadata.Response (MetadataResponse(..), MetadataBroker(..), MetadataTopic(..), MetadataPartition(..), parseMetadataResponseV12)
+import qualified Data.ByteString.Char8 as BS8
 import qualified Kafka.Internal.Metadata.Response as M
-import Kafka.Internal.Metadata.Response (MetadataResponse(..), MetadataBroker(..), MetadataTopic(..), MetadataPartition(..), getMetadataResponse, parseMetadataResponse)
 
 ------------------------------------------------------------------------
 -- Types
@@ -107,9 +106,10 @@ newClient cfg = case ccBootstrap cfg of
 -- | Shut down all broker threads and clean up.
 closeClient :: KafkaClient -> IO ()
 closeClient client = do
-  atomically $ writeTVar (kcShutdown client) True
-  brokers <- readTVarIO (kcBrokers client)
-  forM_ (IM.elems brokers) stopBroker
+  brokers <- atomically $ do
+    writeTVar (kcShutdown client) True
+    readTVar (kcBrokers client)
+  mapM_ stopBroker (IM.elems brokers)
 
 ------------------------------------------------------------------------
 -- Broker selection
@@ -117,37 +117,32 @@ closeClient client = do
 
 -- | Pick any broker in BrokerUp state. Returns Nothing if none available.
 anyBroker :: KafkaClient -> IO (Maybe BrokerEnv)
-anyBroker client = do
-  brokers <- readTVarIO (kcBrokers client)
+anyBroker client = atomically $ do
+  brokers <- readTVar (kcBrokers client)
   findUp (IM.elems brokers)
   where
     findUp [] = pure Nothing
-    findUp (env:rest) = do
-      st <- readTVarIO (beState env)
-      if st == BrokerUp
-        then pure (Just env)
-        else findUp rest
-
--- | Get the broker thread for a specific node ID.
-brokerById :: KafkaClient -> Int32 -> IO (Maybe BrokerEnv)
-brokerById client nodeId = do
-  brokers <- readTVarIO (kcBrokers client)
-  pure (IM.lookup (fromIntegral nodeId) brokers)
+    findUp (env:rest) = readTVar (beState env) >>= \case
+      BrokerUp -> pure (Just env)
+      _        -> findUp rest
 
 -- | Find the broker for a topic-partition's leader.
 -- Falls back to any UP broker if leader is unknown or unavailable.
 leaderBrokerFor :: KafkaClient -> TopicName -> Int32 -> IO (Maybe BrokerEnv)
-leaderBrokerFor client topic partition = do
-  meta <- readTVarIO (kcMetadata client)
-  case Map.lookup (topic, partition) (mcPartitionLeaders meta) of
-    Just nodeId -> do
-      mBroker <- brokerById client nodeId
-      case mBroker of
-        Just env -> do
-          st <- readTVarIO (beState env)
-          if st == BrokerUp then pure (Just env) else anyBroker client
-        Nothing -> anyBroker client
-    Nothing -> anyBroker client
+leaderBrokerFor client topic partition = atomically $ do
+  meta <- readTVar (kcMetadata client)
+  brokers <- readTVar (kcBrokers client)
+  case Map.lookup (topic, partition) (mcPartitionLeaders meta)
+       >>= \nodeId -> IM.lookup (fromIntegral nodeId) brokers of
+    Just env -> readTVar (beState env) >>= \case
+      BrokerUp -> pure (Just env)
+      _        -> findUp (IM.elems brokers)
+    Nothing -> findUp (IM.elems brokers)
+  where
+    findUp [] = pure Nothing
+    findUp (env:rest) = readTVar (beState env) >>= \case
+      BrokerUp -> pure (Just env)
+      _        -> findUp rest
 
 ------------------------------------------------------------------------
 -- Metadata
@@ -186,11 +181,13 @@ refreshTopicMetadata client topic = do
 -- | Parse raw response bytes into MetadataResponse.
 parseMetadata :: ByteArray -> Either String MetadataResponse
 parseMetadata bytes =
-  case Smith.parseByteArray parseMetadataResponse bytes of
+  case Smith.parseByteArray parseMetadataResponseV12 bytes of
     Smith.Failure e          -> Left e
     Smith.Success (Smith.Slice _ _ a) -> Right a
 
--- | Update the metadata cache from a MetadataResponse.
+-- | Update the metadata cache and broker map from a MetadataResponse.
+-- Re-keys the broker IntMap from temporary bootstrap IDs to real node IDs
+-- discovered via metadata, so partition leader lookups find the right broker.
 updateMetadataCache :: KafkaClient -> MetadataResponse -> IO ()
 updateMetadataCache client resp = do
   let newLeaders = Map.fromList
@@ -205,10 +202,33 @@ updateMetadataCache client resp = do
         | t <- topics resp
         , errorCode t == 0
         ]
-  atomically $ modifyTVar' (kcMetadata client) $ \old -> MetadataCache
-    { mcPartitionLeaders = Map.union newLeaders (mcPartitionLeaders old)
-    , mcPartitionCounts  = Map.union newCounts  (mcPartitionCounts  old)
-    }
+  -- Re-key broker map: match existing BrokerEnvs by address to real node IDs
+  let metaBrokers = brokers resp
+  atomically $ do
+    modifyTVar' (kcMetadata client) $ \old -> MetadataCache
+      { mcPartitionLeaders = Map.union newLeaders (mcPartitionLeaders old)
+      , mcPartitionCounts  = Map.union newCounts  (mcPartitionCounts  old)
+      }
+    oldMap <- readTVar (kcBrokers client)
+    let addrMap = Map.fromList
+          [ (brokerAddrKey (beBrokerAddress env), env)
+          | env <- IM.elems oldMap
+          ]
+        rekeyed = IM.fromList
+          [ (fromIntegral (M.nodeId mb), env { beNodeId = M.nodeId mb })
+          | mb <- metaBrokers
+          , Just env <- [Map.lookup (metaBrokerAddrKey mb) addrMap]
+          ]
+    -- Only update if we found matches (don't lose brokers)
+    if not (IM.null rekeyed)
+      then writeTVar (kcBrokers client) rekeyed
+      else pure ()
+  where
+    brokerAddrKey :: BrokerAddress -> (String, Int)
+    brokerAddrKey (BrokerAddress h p) = (h, fromIntegral p)
+
+    metaBrokerAddrKey :: MetadataBroker -> (String, Int)
+    metaBrokerAddrKey mb = (BS8.unpack (M.host mb), fromIntegral (M.port mb))
 
 ------------------------------------------------------------------------
 -- Internal helpers
@@ -233,6 +253,6 @@ waitForAnyBroker client timeoutUs = do
           else retry
   where
     checkAnyUp [] = pure False
-    checkAnyUp (env:rest) = do
-      st <- readTVar (beState env)
-      if st == BrokerUp then pure True else checkAnyUp rest
+    checkAnyUp (env:rest) = readTVar (beState env) >>= \case
+      BrokerUp -> pure True
+      _        -> checkAnyUp rest

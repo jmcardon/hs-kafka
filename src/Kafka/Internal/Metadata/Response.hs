@@ -5,9 +5,11 @@ module Kafka.Internal.Metadata.Response
   , MetadataPartition(..)
   , getMetadataResponse
   , parseMetadataResponse
+  , parseMetadataResponseV12
   ) where
 
 import Control.Concurrent.STM (TVar)
+import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32)
 import Data.Primitive.ByteArray (ByteArray)
 import System.IO (Handle)
@@ -19,16 +21,16 @@ import Kafka.Internal.Response
 data MetadataResponse = MetadataResponse
   { throttleTimeMs :: {-# UNPACK #-} !Int32
   , brokers :: [MetadataBroker]
-  , clusterId :: !(Maybe ByteArray)
+  , clusterId :: !(Maybe ByteString)
   , controllerId :: {-# UNPACK #-} !Int32
   , topics :: [MetadataTopic]
   } deriving (Eq, Show)
 
 data MetadataBroker = MetadataBroker
   { nodeId :: {-# UNPACK #-} !Int32
-  , host :: {-# UNPACK #-} !ByteArray
+  , host :: !ByteString
   , port :: {-# UNPACK #-} !Int32
-  , rack :: !(Maybe ByteArray)
+  , rack :: !(Maybe ByteString)
   } deriving (Eq, Show)
 
 data MetadataTopic = MetadataTopic
@@ -43,46 +45,94 @@ data MetadataPartition = MetadataPartition
   , partitionIndex :: {-# UNPACK #-} !Int32
   , leaderId :: {-# UNPACK #-} !Int32
   , leaderEpoch :: {-# UNPACK #-} !Int32
-  , replicaNodes :: {-# UNPACK #-} !Int32
-  , isrNodes :: {-# UNPACK #-} !Int32
-  , offlineReplicas :: {-# UNPACK #-} !Int32
+  , replicaNodes :: [Int32]
+  , isrNodes :: [Int32]
+  , offlineReplicas :: [Int32]
   } deriving (Eq, Show)
 
+-- | Parse Metadata v7 response (legacy encoding).
 parseMetadataResponse :: Parser MetadataResponse
 parseMetadataResponse = do
   _correlationId <- int32 "correlation id"
   MetadataResponse
     <$> (int32 "throttle time")
-    <*> (array parseMetadataBroker <?> "brokers")
-    <*> (nullableByteArray <?> "cluster id")
+    <*> (array parseMetadataBrokerLegacy <?> "brokers")
+    <*> (fmap (fmap byteArrayToByteString) (nullableByteArray) <?> "cluster id")
     <*> (int32 "controller id")
-    <*> (array parseMetadataTopic <?> "topics")
+    <*> (array parseMetadataTopicLegacy <?> "topics")
 
-parseMetadataBroker :: Parser MetadataBroker
-parseMetadataBroker = MetadataBroker
-  <$> (int32 "node id")
-  <*> (bytearray <?> "host")
-  <*> (int32 "port")
-  <*> (nullableByteArray <?> "rack")
+parseMetadataBrokerLegacy :: Parser MetadataBroker
+parseMetadataBrokerLegacy = do
+  nid <- int32 "node id"
+  h <- bytearray
+  p <- int32 "port"
+  r <- nullableByteArray
+  pure (MetadataBroker nid (byteArrayToByteString h) p (fmap byteArrayToByteString r))
 
-parseMetadataTopic :: Parser MetadataTopic
-parseMetadataTopic = do
-  MetadataTopic
-    <$> (int16 "error code")
-    <*> (topicName <?> "name")
-    <*> (bool "is internal")
-    <*> (array parseMetadataPartition <?> "partitions")
+parseMetadataTopicLegacy :: Parser MetadataTopic
+parseMetadataTopicLegacy = do
+  ec <- int16 "error code"
+  tn <- topicName
+  internal <- bool "is internal"
+  parts <- array parseMetadataPartitionLegacy
+  pure (MetadataTopic ec tn internal parts)
 
-parseMetadataPartition :: Parser MetadataPartition
-parseMetadataPartition = do
-  MetadataPartition
-    <$> (int16 "error code")
-    <*> (int32 "partition index")
-    <*> (int32 "leader id")
-    <*> (int32 "leader epoch")
-    <*> (int32 "replica nodes")
-    <*> (int32 "isr nodes")
-    <*> (int32 "offline replicas")
+parseMetadataPartitionLegacy :: Parser MetadataPartition
+parseMetadataPartitionLegacy = do
+  ec <- int16 "error code"
+  idx <- int32 "partition index"
+  leader <- int32 "leader id"
+  epoch <- int32 "leader epoch"
+  _replicas <- int32 "replica nodes"
+  _isrs <- int32 "isr nodes"
+  _offline <- int32 "offline replicas"
+  pure (MetadataPartition ec idx leader epoch [] [] [])
+
+-- | Parse Metadata v12+ response (flexible/compact encoding).
+-- Response header v1: correlation_id + tagged_fields (KIP-482).
+parseMetadataResponseV12 :: Parser MetadataResponse
+parseMetadataResponseV12 = do
+  _correlationId <- int32 "correlation id"
+  skipTaggedFields  -- response header v1 tagged fields
+  throttle <- int32 "throttle time"
+  brokersL <- compactArray parseMetadataBrokerV12
+  clId <- compactNullableString
+  ctrl <- int32 "controller id"
+  topicsL <- compactArray parseMetadataTopicV12
+  skipTaggedFields  -- body tagged fields
+  pure (MetadataResponse throttle brokersL clId ctrl topicsL)
+
+parseMetadataBrokerV12 :: Parser MetadataBroker
+parseMetadataBrokerV12 = do
+  nid <- int32 "node id"
+  h <- compactString
+  p <- int32 "port"
+  r <- compactNullableString
+  skipTaggedFields
+  pure (MetadataBroker nid h p r)
+
+parseMetadataTopicV12 :: Parser MetadataTopic
+parseMetadataTopicV12 = do
+  ec <- int16 "error code"
+  tn <- TopicName <$> compactString
+  _topicId <- int64 "topic id high" >> int64 "topic id low"  -- UUID: 16 bytes
+  internal <- bool "is internal"
+  parts <- compactArray parseMetadataPartitionV12
+  _topicAuthorizedOps <- int32 "topic authorized operations"
+  skipTaggedFields
+  pure (MetadataTopic ec tn internal parts)
+
+parseMetadataPartitionV12 :: Parser MetadataPartition
+parseMetadataPartitionV12 = do
+  ec <- int16 "error code"
+  idx <- int32 "partition index"
+  leader <- int32 "leader id"
+  epoch <- int32 "leader epoch"
+  replicas <- compactArray (int32 "replica")
+  isrs <- compactArray (int32 "isr")
+  offline <- compactArray (int32 "offline")
+  skipTaggedFields
+  pure (MetadataPartition ec idx leader epoch replicas isrs offline)
 
 getMetadataResponse ::
      Kafka

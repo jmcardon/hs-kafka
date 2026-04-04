@@ -10,6 +10,7 @@ module Kafka.Internal.Produce.Response
   , ProduceResponseMessage(..)
   , getProduceResponse
   , parseProduceResponse
+  , parseProduceResponseV9
   ) where
 
 import Control.Concurrent.STM (TVar)
@@ -41,9 +42,9 @@ data ProducePartitionResponse = ProducePartitionResponse
   , prResponseLogStartTime :: !Int64
   } deriving (Eq, Show)
 
+-- | Parse Produce v0-v8 response (legacy encoding).
 parseProduceResponse :: Parser ProduceResponse
 parseProduceResponse = do
-  -- we need to consume this, but we discard it. (why?)
   _correlationId <- int32 "correlationId"
   responsesCount <- int32 "responses count"
   ProduceResponse
@@ -61,11 +62,40 @@ parseProduceResponseMessage = do
 
 parseProducePartitionResponse :: Parser ProducePartitionResponse
 parseProducePartitionResponse = ProducePartitionResponse
-  <$> int32 "int32"
-  <*> int16 "int16"
-  <*> int64 "int64"
-  <*> int64 "int64"
-  <*> int64 "int64"
+  <$> int32 "partition"
+  <*> int16 "error code"
+  <*> int64 "base offset"
+  <*> int64 "log append time"
+  <*> int64 "log start time"
+
+-- | Parse Produce v9+ response (flexible/compact encoding).
+-- Response header v1: correlation_id + tagged_fields (KIP-482).
+parseProduceResponseV9 :: Parser ProduceResponse
+parseProduceResponseV9 = do
+  _correlationId <- int32 "correlationId"
+  skipTaggedFields  -- response header v1 tagged fields
+  msgs <- compactArray parseProduceResponseMessageV9
+  throttle <- int32 "throttle time"
+  skipTaggedFields  -- body tagged fields
+  pure (ProduceResponse msgs throttle)
+
+parseProduceResponseMessageV9 :: Parser ProduceResponseMessage
+parseProduceResponseMessageV9 = do
+  topicBS <- compactString
+  resps <- compactArray parseProducePartitionResponseV9
+  skipTaggedFields  -- topic tagged fields
+  pure (ProduceResponseMessage (TopicName topicBS) resps)
+
+parseProducePartitionResponseV9 :: Parser ProducePartitionResponse
+parseProducePartitionResponseV9 = do
+  resp <- ProducePartitionResponse
+    <$> int32 "partition"
+    <*> int16 "error code"
+    <*> int64 "base offset"
+    <*> int64 "log append time"
+    <*> int64 "log start time"
+  skipTaggedFields  -- partition tagged fields
+  pure resp
 
 getProduceResponse ::
      Kafka

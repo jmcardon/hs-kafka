@@ -1,6 +1,7 @@
 module Kafka.Internal.InitProducerId.Response
   ( InitProducerIdResponse(..)
   , parseInitProducerIdResponse
+  , parseInitProducerIdResponseV4
   , getInitProducerIdResponse
   ) where
 
@@ -19,6 +20,7 @@ data InitProducerIdResponse = InitProducerIdResponse
   , ipProducerEpoch  :: {-# UNPACK #-} !Int16
   } deriving (Eq, Show)
 
+-- | Parse InitProducerId v0-v3 response (legacy encoding).
 parseInitProducerIdResponse :: Parser InitProducerIdResponse
 parseInitProducerIdResponse = do
   _correlationId <- int32 "correlation id"
@@ -27,6 +29,20 @@ parseInitProducerIdResponse = do
     <*> int16 "error code"
     <*> int64 "producer id"
     <*> int16 "producer epoch"
+
+-- | Parse InitProducerId v4+ response (flexible/compact encoding).
+-- Response header v1: correlation_id + tagged_fields (KIP-482).
+parseInitProducerIdResponseV4 :: Parser InitProducerIdResponse
+parseInitProducerIdResponseV4 = do
+  _correlationId <- int32 "correlation id"
+  skipTaggedFields  -- response header v1 tagged fields
+  resp <- InitProducerIdResponse
+    <$> int32 "throttle time"
+    <*> int16 "error code"
+    <*> int64 "producer id"
+    <*> int16 "producer epoch"
+  skipTaggedFields  -- body tagged fields
+  pure resp
 
 getInitProducerIdResponse ::
      Kafka

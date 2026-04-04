@@ -3,6 +3,8 @@
 
 module Kafka.Internal.Produce.Request
   ( produceRequest
+  , produceRequestIdempotent
+  , produceRequestCompressed
   ) where
 
 import Control.Monad.ST (runST)
@@ -23,15 +25,17 @@ import Data.Word (Word8)
 import qualified Crc32c as CRC
 
 import Kafka.Common
+import Kafka.Internal.Compression (compressBatch)
+import Kafka.Internal.Config (Compression(..))
 import Kafka.Internal.Writer
 import Kafka.Internal.Zigzag (zigzag)
 
--- idk what this is
+-- Record batch magic byte (message format v2)
 magic :: Int8
 magic = 2
 
 produceApiVersion :: Int16
-produceApiVersion = 7
+produceApiVersion = 9
 
 produceApiKey :: Int16
 produceApiKey = 0
@@ -54,25 +58,13 @@ defaultFirstTimestamp = 0
 defaultMaxTimestamp :: Int64
 defaultMaxTimestamp = 0
 
-defaultProducerId :: Int64
-defaultProducerId = -1
-
-defaultProducerEpoch :: Int16
-defaultProducerEpoch = -1
-
-defaultBaseSequence :: Int32
-defaultBaseSequence = -1
-
-defaultRecordBatchAttributes :: Int16
-defaultRecordBatchAttributes = 0
-
 -- | Convert a ByteArray to a ByteString.
 baToBS :: ByteArray -> ByteString
 baToBS ba = Data.Bytes.toByteString (Bytes ba 0 (sizeofByteArray ba))
 
--- | Convert a ByteString to a ByteArray.
+-- | Convert a ByteString to a ByteArray (single memcpy).
 bsToBA :: ByteString -> ByteArray
-bsToBA bstr = byteArrayFromList (BS.unpack bstr)
+bsToBA bs = Data.Bytes.toByteArrayClone (Data.Bytes.fromByteString bs)
 
 -- | Materialize a BuildR to a ByteArray (for CRC computation).
 buildToBA :: BuildR -> ByteArray
@@ -96,26 +88,26 @@ makeRecordMetadata index content =
 sumSizes :: UnliftedArray ByteArray -> Int
 sumSizes = foldrUnliftedArray (\e acc -> acc + sizeofByteArray e) 0
 
-produceRequestRecordBatchMetadata ::
-     UnliftedArray ByteArray
-  -> Int
-  -> Int
+-- | Build record batch metadata with CRC over postCrc + records.
+-- The records ByteArray is the (possibly compressed) records section.
+recordBatchMetadataWithRecords ::
+     Int64 -- ^ producerId (-1 for non-idempotent)
+  -> Int16 -- ^ producerEpoch (-1 for non-idempotent)
+  -> Int32 -- ^ baseSequence (-1 for non-idempotent)
+  -> Int16 -- ^ record batch attributes (compression bits)
+  -> Int   -- ^ record count
+  -> ByteArray -- ^ records section (possibly compressed)
   -> ByteArray
-produceRequestRecordBatchMetadata payloadsSectionChunks payloadCount payloadsSectionSize =
+recordBatchMetadataWithRecords !producerId !producerEpoch !baseSeq !batchAttrs
+    !recordCount records =
   let
-    crc = crcOverChunks
-        (CRC.bytes 0 (Bytes postCrc 0 postCrcLength))
-        payloadsSectionChunks 0 (3*payloadCount)
-    crcOverChunks !acc _arr !ix !end
-      | ix >= end = acc
-      | otherwise =
-          let ba = indexUnliftedArray payloadsSectionChunks ix
-          in crcOverChunks (CRC.bytes acc (Bytes ba 0 (sizeofByteArray ba)))
-               payloadsSectionChunks (ix + 1) end
+    recordsSize = sizeofByteArray records
+    crc = CRC.bytes (CRC.bytes 0 (Bytes postCrc 0 postCrcLength))
+            (Bytes records 0 recordsSize)
     batchLength = fromIntegral $
         preCrcLength
       + postCrcLength
-      + payloadsSectionSize
+      + recordsSize
     preCrcLength = 9
     preCrc = buildToBA $
       int64 defaultBaseOffset
@@ -125,79 +117,84 @@ produceRequestRecordBatchMetadata payloadsSectionChunks payloadCount payloadsSec
       <> int32 (fromIntegral crc)
     postCrcLength = 40
     postCrc = buildToBA $
-      int16 defaultRecordBatchAttributes
-      <> int32 (fromIntegral (payloadCount - 1))
+      int16 batchAttrs
+      <> int32 (fromIntegral (recordCount - 1))
       <> int64 defaultFirstTimestamp
       <> int64 defaultMaxTimestamp
-      <> int64 defaultProducerId
-      <> int16 defaultProducerEpoch
-      <> int32 defaultBaseSequence
-      <> int32 (fromIntegral payloadCount)
+      <> int64 producerId
+      <> int16 producerEpoch
+      <> int32 baseSeq
+      <> int32 (fromIntegral recordCount)
   in
     preCrc <> postCrc
 
-makeRequestMetadata :: ()
-  => Int16 -- ^ acks value
+-- | Build the Produce v9 request prefix (everything before the record batch bytes).
+-- Uses flexible encoding (compact strings/arrays + tagged fields).
+-- Layout: header v2 | body fields | topic array header | partition fields | records length
+-- After this, the caller appends: record batch bytes | partition TF | topic TF | body TF
+makeRequestPrefix ::
+     Int16 -- ^ acks value
   -> ByteString -- ^ client ID
   -> Int -- ^ record batch section size
-  -> Int -- ^ timeout (microseconds)
+  -> Int -- ^ timeout (ms)
   -> TopicName -- ^ topic name
   -> Int32 -- ^ partition
-  -> ByteArray
-makeRequestMetadata !acksVal !cid !rbss !timeout tn !partition = buildToBA $
-  int32 size
-  <> int16 produceApiKey
+  -> BuildR
+makeRequestPrefix !acksVal !cid !rbss !timeout (TopicName tn) !partition =
+  -- Request header v2 (clientId is always legacy INT16 string per KIP-482)
+  int16 produceApiKey
   <> int16 produceApiVersion
   <> int32 correlationId
-  <> string cid
-  <> int16 (-1) -- transactional_id length
-  <> int16 acksVal -- acks
-  <> int32 (fromIntegral timeout) -- timeout in ms
-  <> int32 1 -- following array length
-  <> topicName tn -- topic_data topic
-  <> int32 1 -- following array [data] length
-  <> int32 partition -- partition
-  <> int32 (fromIntegral rbss) -- record_set length
-  where
-    minimumSize = 36
-    cidLen = BS.length cid
-    topicNameSize = BS.length (coerce tn :: ByteString)
-    size = fromIntegral $ 0
-      + minimumSize
-      + cidLen
-      + topicNameSize
-      + rbss
+  <> string cid                         -- clientId (legacy INT16 string, even in flexible)
+  <> taggedFields                       -- header tagged fields (0 = none)
+  -- Produce v9 body fields
+  <> compactNullableString Nothing      -- transactional_id (null = non-transactional)
+  <> int16 acksVal                      -- acks
+  <> int32 (fromIntegral timeout)       -- timeout_ms
+  <> unsignedVarInt 2                   -- compact array: 1 topic (count+1)
+  -- TopicProduceData
+  <> compactString tn                   -- topic name (COMPACT_STRING)
+  <> unsignedVarInt 2                   -- compact array: 1 partition (count+1)
+  -- PartitionProduceData
+  <> int32 partition                    -- partition index
+  <> unsignedVarInt (rbss + 1)          -- records length (compact bytes: UVARINT(len+1))
 
-produceRequest ::
+-- | Gather payload section chunks into a single ByteArray.
+gatherChunks :: UnliftedArray ByteArray -> ByteArray
+gatherChunks = foldrUnliftedArray (<>) mempty
+
+-- | Build the full produce payload for Produce v9 (flexible encoding).
+--
+-- Wire layout:
+--   INT32 total_body_size
+--   [request header v2]
+--   [produce body: transactional_id, acks, timeout, topic_data array]
+--     [TopicProduceData: name, partition_data array]
+--       [PartitionProduceData: index, INT32 records_length, record_batch_bytes, taggedFields]
+--     [topic taggedFields]
+--   [body taggedFields]
+buildProducePayload ::
      Int16 -- ^ acks
   -> ByteString -- ^ client ID
   -> Int -- ^ timeout (ms)
   -> TopicName
-  -> Int32
-  -> UnliftedArray ByteArray
+  -> Int32 -- ^ partition
+  -> Int64 -- ^ producerId
+  -> Int16 -- ^ producerEpoch
+  -> Int32 -- ^ baseSequence
+  -> Compression -- ^ compression codec
+  -> UnliftedArray ByteArray -- ^ payloads
   -> BSL.ByteString
-produceRequest acksVal cid timeout topic partition payloads =
+buildProducePayload acksVal cid timeout topic partition
+    producerId producerEpoch baseSeq compression payloads =
   let
     payloadCount = sizeofUnliftedArray payloads
     zero = runST $ do
       ba <- newByteArray 1
       writeByteArray ba 0 (0 :: Word8)
       unsafeFreezeByteArray ba
-    recordBatchSectionSize = 0
-      + sumSizes payloadsSectionChunks
-      + sizeofByteArray recordBatchMetadata
-    requestMetadata = makeRequestMetadata
-      acksVal
-      cid
-      recordBatchSectionSize
-      timeout
-      topic
-      partition
-    recordBatchMetadata =
-      produceRequestRecordBatchMetadata
-        payloadsSectionChunks
-        payloadCount
-        (sumSizes payloadsSectionChunks)
+
+    -- Build the records section (metadata + payload + zero per record)
     payloadsSectionChunks = runUnliftedArray $ do
       arr <- newUnliftedArray (3 * payloadCount) zero
       itraverseUnliftedArray_
@@ -207,18 +204,79 @@ produceRequest acksVal cid timeout topic partition payloads =
           writeUnliftedArray arr (i * 3 + 2) zero)
         payloads
       pure arr
-    finalArr = runUnliftedArray $ do
-      arr <- newUnliftedArray (3 * payloadCount + 2) zero
-      writeUnliftedArray arr 0 requestMetadata
-      writeUnliftedArray arr 1 recordBatchMetadata
-      copyUnliftedArray arr 2 payloadsSectionChunks 0 (3 * payloadCount)
-      pure arr
-  in gatherToLBS finalArr
 
--- | Gather an UnliftedArray ByteArray into a lazy ByteString.
--- Concatenates all ByteArray chunks into a single contiguous ByteArray
--- first (one allocation, one copy), then converts to ByteString.
-gatherToLBS :: UnliftedArray ByteArray -> BSL.ByteString
-gatherToLBS chunks =
-  let gathered = foldrUnliftedArray (<>) mempty chunks
-  in BSL.fromStrict (baToBS gathered)
+    -- Gather records into single ByteArray, then optionally compress
+    rawRecords = gatherChunks payloadsSectionChunks
+    (!records, !compressionAttr) = compressBatch compression rawRecords
+
+    -- Build record batch metadata (preCrc + postCrc with CRC over postCrc + records)
+    rbMeta = recordBatchMetadataWithRecords
+      producerId producerEpoch baseSeq compressionAttr
+      payloadCount records
+
+    -- Record batch section = rbMeta + records
+    recordBatchSection = rbMeta <> records
+    recordBatchSectionSize = sizeofByteArray recordBatchSection
+
+    -- Build prefix (everything before record batch bytes)
+    prefixBuilder = makeRequestPrefix acksVal cid recordBatchSectionSize timeout topic partition
+    -- Suffix: trailing tagged fields (partition, topic, body)
+    suffixBuilder = taggedFields <> taggedFields <> taggedFields
+
+    -- Assemble the full body (after size prefix)
+    prefixBytes = toLazyByteString prefixBuilder
+    recordBatchBS = BSL.fromStrict (baToBS recordBatchSection)
+    suffixBytes = toLazyByteString suffixBuilder
+    fullBody = prefixBytes <> recordBatchBS <> suffixBytes
+
+    -- Size prefix
+    bodySize = fromIntegral (BSL.length fullBody) :: Int32
+
+  in toLazyByteString (int32 bodySize) <> fullBody
+
+-- | Build a produce request (non-idempotent, no compression).
+-- PID/epoch/sequence are set to -1.
+produceRequest ::
+     Int16 -- ^ acks
+  -> ByteString -- ^ client ID
+  -> Int -- ^ timeout (ms)
+  -> TopicName
+  -> Int32
+  -> UnliftedArray ByteArray
+  -> BSL.ByteString
+produceRequest acksVal cid timeout topic partition payloads =
+  buildProducePayload acksVal cid timeout topic partition
+    (-1) (-1) (-1) NoCompression payloads
+
+-- | Build a produce request with idempotent producer state.
+-- PID/epoch/baseSequence are provided from the idempotent state.
+produceRequestIdempotent ::
+     Int16 -- ^ acks (should be -1 for idempotent)
+  -> ByteString -- ^ client ID
+  -> Int -- ^ timeout (ms)
+  -> TopicName
+  -> Int32 -- ^ partition
+  -> Int64 -- ^ producerId
+  -> Int16 -- ^ producerEpoch
+  -> Int32 -- ^ baseSequence for this partition
+  -> UnliftedArray ByteArray -- ^ payloads
+  -> BSL.ByteString
+produceRequestIdempotent acksVal cid timeout topic partition
+    producerId producerEpoch baseSeq payloads =
+  buildProducePayload acksVal cid timeout topic partition
+    producerId producerEpoch baseSeq NoCompression payloads
+
+-- | Build a produce request with compression and optional idempotent state.
+produceRequestCompressed ::
+     Int16 -- ^ acks
+  -> ByteString -- ^ client ID
+  -> Int -- ^ timeout (ms)
+  -> TopicName
+  -> Int32 -- ^ partition
+  -> Int64 -- ^ producerId (-1 for non-idempotent)
+  -> Int16 -- ^ producerEpoch (-1 for non-idempotent)
+  -> Int32 -- ^ baseSequence (-1 for non-idempotent)
+  -> Compression -- ^ compression codec
+  -> UnliftedArray ByteArray -- ^ payloads
+  -> BSL.ByteString
+produceRequestCompressed = buildProducePayload

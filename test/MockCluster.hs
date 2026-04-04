@@ -12,21 +12,27 @@
 module MockCluster
   ( MockCluster(..)
   , withMockCluster
+  , createMockCluster
+  , destroyMockCluster
   , mockCreateTopic
   , mockBrokerDown
   , mockBrokerUp
+  , mockPushRequestErrors
+  , mockClearRequestErrors
+  , mockPartitionSetLeader
+  , mockBrokerSetRtt
   , parseBootstraps
   ) where
 
 import Control.Exception (bracket)
-import Data.Int (Int32)
+import Data.Int (Int16, Int32)
 import Foreign.C.String (CString, withCString, peekCString)
 import Foreign.C.Types (CInt(..), CSize(..))
 import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Marshal.Array (withArrayLen)
 import Foreign.Ptr (Ptr, nullPtr)
 
 import Kafka.Internal.Config (BrokerAddress(..))
-import Network.Socket (PortNumber)
 
 ------------------------------------------------------------------------
 -- Opaque C types
@@ -74,6 +80,22 @@ foreign import ccall unsafe "rdkafka_mock.h rd_kafka_mock_broker_set_down"
 foreign import ccall unsafe "rdkafka_mock.h rd_kafka_mock_broker_set_up"
   c_rd_kafka_mock_broker_set_up :: Ptr RdKafkaMockCluster -> Int32 -> IO CInt
 
+foreign import ccall unsafe "rdkafka_mock.h rd_kafka_mock_push_request_errors_array"
+  c_rd_kafka_mock_push_request_errors_array
+    :: Ptr RdKafkaMockCluster -> Int16 -> CSize -> Ptr CInt -> IO ()
+
+foreign import ccall unsafe "rdkafka_mock.h rd_kafka_mock_clear_request_errors"
+  c_rd_kafka_mock_clear_request_errors
+    :: Ptr RdKafkaMockCluster -> Int16 -> IO ()
+
+foreign import ccall unsafe "rdkafka_mock.h rd_kafka_mock_partition_set_leader"
+  c_rd_kafka_mock_partition_set_leader
+    :: Ptr RdKafkaMockCluster -> CString -> Int32 -> Int32 -> IO CInt
+
+foreign import ccall unsafe "rdkafka_mock.h rd_kafka_mock_broker_set_rtt"
+  c_rd_kafka_mock_broker_set_rtt
+    :: Ptr RdKafkaMockCluster -> Int32 -> CInt -> IO CInt
+
 ------------------------------------------------------------------------
 -- High-level wrapper
 ------------------------------------------------------------------------
@@ -87,44 +109,44 @@ data MockCluster = MockCluster
 -- | Create a mock Kafka cluster with the given number of brokers.
 -- The cluster is destroyed when the action completes.
 withMockCluster :: Int -> (MockCluster -> IO a) -> IO a
-withMockCluster brokerCount action =
-  bracket createCluster destroyCluster action
-  where
-    createCluster = do
-      -- Create a minimal rd_kafka_t harness (producer, no bootstrap needed)
-      conf <- c_rd_kafka_conf_new
-      withCString "client.id" $ \k ->
-        withCString "mock-harness" $ \v ->
-          allocaBytes 512 $ \errBuf ->
-            c_rd_kafka_conf_set conf k v errBuf 512 >> pure ()
+withMockCluster brokerCount = bracket (createMockCluster brokerCount) destroyMockCluster
 
-      rk <- allocaBytes 512 $ \errBuf ->
-        c_rd_kafka_new rdKafkaProducer conf errBuf 512
-      if rk == nullPtr
-        then error "failed to create rd_kafka_t harness"
-        else pure ()
+-- | Create a mock cluster (caller must call 'destroyMockCluster').
+createMockCluster :: Int -> IO MockCluster
+createMockCluster brokerCount = do
+  conf <- c_rd_kafka_conf_new
+  withCString "client.id" $ \k ->
+    withCString "mock-harness" $ \v ->
+      allocaBytes 512 $ \errBuf ->
+        c_rd_kafka_conf_set conf k v errBuf 512 >> pure ()
 
-      -- Create mock cluster
-      cluster <- c_rd_kafka_mock_cluster_new rk (fromIntegral brokerCount)
-      if cluster == nullPtr
-        then do
-          c_rd_kafka_destroy rk
-          error "failed to create mock cluster"
-        else pure ()
+  rk <- allocaBytes 512 $ \errBuf ->
+    c_rd_kafka_new rdKafkaProducer conf errBuf 512
+  if rk == nullPtr
+    then error "failed to create rd_kafka_t harness"
+    else pure ()
 
-      -- Get bootstrap addresses
-      bootstrapsCStr <- c_rd_kafka_mock_cluster_bootstraps cluster
-      bootstraps <- peekCString bootstrapsCStr
+  cluster <- c_rd_kafka_mock_cluster_new rk (fromIntegral brokerCount)
+  if cluster == nullPtr
+    then do
+      c_rd_kafka_destroy rk
+      error "failed to create mock cluster"
+    else pure ()
 
-      pure MockCluster
-        { mcRdKafka    = rk
-        , mcCluster    = cluster
-        , mcBootstraps = bootstraps
-        }
+  bootstrapsCStr <- c_rd_kafka_mock_cluster_bootstraps cluster
+  bootstraps <- peekCString bootstrapsCStr
 
-    destroyCluster mc = do
-      c_rd_kafka_mock_cluster_destroy (mcCluster mc)
-      c_rd_kafka_destroy (mcRdKafka mc)
+  pure MockCluster
+    { mcRdKafka    = rk
+    , mcCluster    = cluster
+    , mcBootstraps = bootstraps
+    }
+
+-- | Destroy a mock cluster.
+destroyMockCluster :: MockCluster -> IO ()
+destroyMockCluster mc = do
+  c_rd_kafka_mock_cluster_destroy (mcCluster mc)
+  c_rd_kafka_destroy (mcRdKafka mc)
 
 -- | Create a topic on the mock cluster.
 mockCreateTopic :: MockCluster -> String -> Int -> Int -> IO ()
@@ -147,6 +169,34 @@ mockBrokerDown mc brokerId = do
 mockBrokerUp :: MockCluster -> Int32 -> IO ()
 mockBrokerUp mc brokerId = do
   _ <- c_rd_kafka_mock_broker_set_up (mcCluster mc) brokerId
+  pure ()
+
+-- | Push error codes onto the mock cluster's error stack for a given API key.
+-- The next N requests for that API key will return these errors in order.
+-- API keys: 0 = Produce, 1 = Fetch, 3 = Metadata, etc.
+mockPushRequestErrors :: MockCluster -> Int16 -> [CInt] -> IO ()
+mockPushRequestErrors mc apiKey errs =
+  withArrayLen errs $ \len ptr ->
+    c_rd_kafka_mock_push_request_errors_array
+      (mcCluster mc) apiKey (fromIntegral len) ptr
+
+-- | Clear the error stack for a given API key.
+mockClearRequestErrors :: MockCluster -> Int16 -> IO ()
+mockClearRequestErrors mc apiKey =
+  c_rd_kafka_mock_clear_request_errors (mcCluster mc) apiKey
+
+-- | Set the leader broker for a topic-partition.
+-- broker_id = -1 makes the partition leader-less.
+mockPartitionSetLeader :: MockCluster -> String -> Int32 -> Int32 -> IO ()
+mockPartitionSetLeader mc topic partition brokerId =
+  withCString topic $ \cTopic -> do
+    _ <- c_rd_kafka_mock_partition_set_leader (mcCluster mc) cTopic partition brokerId
+    pure ()
+
+-- | Set artificial RTT (latency) on a broker in milliseconds.
+mockBrokerSetRtt :: MockCluster -> Int32 -> Int -> IO ()
+mockBrokerSetRtt mc brokerId rttMs = do
+  _ <- c_rd_kafka_mock_broker_set_rtt (mcCluster mc) brokerId (fromIntegral rttMs)
   pure ()
 
 ------------------------------------------------------------------------

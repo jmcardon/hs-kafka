@@ -14,6 +14,8 @@
 --   - Two sub-threads per connection: sender + receiver
 --   - Batching in the sender thread (linger + size + count thresholds)
 --   - Reconnection with exponential backoff + jitter
+--   - ProduceResponse error parsing with retry on retriable errors
+--   - In-flight request limit (max.in.flight.requests.per.connection)
 --
 -- Key librdkafka references:
 --   rdkafka_broker.c:4505   rd_kafka_broker_thread_main
@@ -25,28 +27,29 @@ module Kafka.Internal.Broker
   , BrokerState(..)
   , BrokerOp(..)
   , PendingMessage(..)
+  , IdempotentRef(..)
   , newBrokerEnv
   , startBrokerThread
   , stopBroker
   , enqueueProduce
   , enqueueRequest
+  , setIdempotentState
   ) where
 
-import Control.Concurrent (forkIO, ThreadId, killThread, threadDelay, myThreadId)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.Async (race_)
+import Control.Concurrent.MVar (MVar, modifyMVar)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, IOException, try, throwTo)
-import Control.Monad (unless, void)
+import Control.Exception (SomeException, IOException, try)
+import Control.Monad (unless, void, forM_)
 import Data.Bits (shiftR)
-import Data.ByteString (ByteString)
 import Data.IntMap.Strict (IntMap)
 import Data.IORef
-import Data.Int (Int32)
+import Data.Int (Int16, Int32, Int64)
 import Data.Map.Strict (Map)
-import Control.Monad.ST (runST)
-import Data.Primitive.ByteArray (ByteArray, sizeofByteArray, indexByteArray,
-  newByteArray, writeByteArray, unsafeFreezeByteArray, copyByteArray)
+import Data.Primitive.ByteArray (ByteArray, sizeofByteArray, indexByteArray)
 import Data.Primitive.Unlifted.Array
-import Data.Word (Word8, Word32, byteSwap32)
+import Data.Word (Word32, byteSwap32)
 import Numeric.Natural (Natural)
 
 import qualified Data.ByteString as BS
@@ -60,7 +63,9 @@ import Kafka.Internal.ApiVersions.Request (apiVersionsRequest)
 import Kafka.Internal.ApiVersions.Response (ApiVersionsResponse(..), ApiVersionEntry(..),
   parseApiVersionsResponse)
 import Kafka.Internal.Config
-import Kafka.Internal.Produce.Request (produceRequest)
+import Kafka.Internal.Produce.Request (produceRequestCompressed)
+import Kafka.Internal.Produce.Response (ProduceResponse(..), ProduceResponseMessage(..),
+  ProducePartitionResponse(..), parseProduceResponseV9)
 import Kafka.Internal.Reconnect
 import Kafka.Internal.Response (getKafkaResponse)
 
@@ -75,8 +80,9 @@ data BrokerState = BrokerInit | BrokerDown | BrokerConnecting | BrokerUp
 
 -- | A message waiting to be batched and sent.
 data PendingMessage = PendingMessage
-  { pmPayload  :: !ByteArray
-  , pmResult   :: !(TMVar (Either KafkaException ()))
+  { pmPayload     :: !ByteArray
+  , pmResult      :: !(TMVar (Either KafkaException ()))
+  , pmRetriesLeft :: {-# UNPACK #-} !Int
   }
 
 -- | Operations enqueued to a broker thread.
@@ -95,8 +101,8 @@ data BrokerOp
 -- | Inflight request entry — how to dispatch the response.
 data InflightEntry
   = InflightRaw    !(TMVar (Either KafkaException ByteArray))
-  | InflightBatch  !TopicName ![(Int32, [TMVar (Either KafkaException ())])]
-    -- ^ topic, [(partition, [callbacks])]
+  | InflightBatch  !TopicName ![(Int32, [PendingMessage])]
+    -- ^ topic, [(partition, [messages with retry info])]
 
 -- | Batch accumulator for produce messages.
 -- Messages are accumulated in reverse order per (topic, partition).
@@ -131,17 +137,29 @@ batchReadyByThreshold cfg b =
 
 -- | Per-broker thread environment.
 data BrokerEnv = BrokerEnv
-  { beNodeId      :: {-# UNPACK #-} !Int32
-  , beBrokerAddress        :: !BrokerAddress
-  , beOps         :: !(TBQueue BrokerOp)
-  , beState       :: !(TVar BrokerState)
-  , beInflight    :: !(TVar (IntMap InflightEntry))
-  , beCorrCounter :: !(IORef Int32)
-  , beReconnect   :: !(IORef ReconnectState)
-  , beConfig      :: !ClientConfig
-  , beShutdown    :: !(TVar Bool)
-  , beThread      :: !(IORef (Maybe ThreadId))
-  , beApiVersions :: !(TVar (Maybe [ApiVersionEntry]))
+  { beNodeId         :: {-# UNPACK #-} !Int32
+  , beBrokerAddress  :: !BrokerAddress
+  , beOps            :: !(TBQueue BrokerOp)
+  , beState          :: !(TVar BrokerState)
+  , beInflight       :: !(TVar (IntMap InflightEntry))
+  , beInflightCount  :: !(TVar Int)
+    -- ^ Current number of inflight produce requests (for max.in.flight limit).
+  , beCorrCounter    :: !(IORef Int32)
+  , beReconnect      :: !(IORef ReconnectState)
+  , beConfig         :: !ClientConfig
+  , beShutdown       :: !(TVar Bool)
+  , beApiVersions    :: !(TVar (Maybe [ApiVersionEntry]))
+  , beIdempotent     :: !(IORef (Maybe IdempotentRef))
+    -- ^ When set, enables idempotent produce with PID/epoch/sequences.
+    -- Mutable so Producer can set it after InitProducerId without
+    -- replacing the BrokerEnv in the client's IntMap.
+  }
+
+-- | Shared idempotent producer state, set from the Producer layer.
+data IdempotentRef = IdempotentRef
+  { irProducerId    :: {-# UNPACK #-} !Int64
+  , irProducerEpoch :: {-# UNPACK #-} !Int16
+  , irSequences     :: !(MVar (Map (TopicName, Int32) Int32))
   }
 
 ------------------------------------------------------------------------
@@ -153,26 +171,33 @@ newBrokerEnv cfg nodeId peer = do
   ops       <- newTBQueueIO (fromIntegral (ccQueueSize cfg) :: Natural)
   state     <- newTVarIO BrokerInit
   inflight  <- newTVarIO IM.empty
+  inflightC <- newTVarIO 0
   corrId    <- newIORef 0
   reconn    <- newIORef (newReconnectState (ccReconnectMs cfg)
                                            (ccReconnectMaxMs cfg)
                                            (fromIntegral nodeId + 12345))
   shutdown  <- newTVarIO False
-  threadRef <- newIORef Nothing
   apiVers   <- newTVarIO Nothing
+  idempRef  <- newIORef Nothing
   pure BrokerEnv
-    { beNodeId      = nodeId
-    , beBrokerAddress        = peer
-    , beOps         = ops
-    , beState       = state
-    , beInflight    = inflight
-    , beCorrCounter = corrId
-    , beReconnect   = reconn
-    , beConfig      = cfg
-    , beShutdown    = shutdown
-    , beThread      = threadRef
-    , beApiVersions = apiVers
+    { beNodeId         = nodeId
+    , beBrokerAddress  = peer
+    , beOps            = ops
+    , beState          = state
+    , beInflight       = inflight
+    , beInflightCount  = inflightC
+    , beCorrCounter    = corrId
+    , beReconnect      = reconn
+    , beConfig         = cfg
+    , beShutdown       = shutdown
+    , beApiVersions    = apiVers
+    , beIdempotent     = idempRef
     }
+
+-- | Set idempotent state on a broker env (called from Producer after InitProducerId).
+setIdempotentState :: BrokerEnv -> Int64 -> Int16 -> MVar (Map (TopicName, Int32) Int32) -> IO ()
+setIdempotentState env pid epoch seqs =
+  writeIORef (beIdempotent env) (Just (IdempotentRef pid epoch seqs))
 
 ------------------------------------------------------------------------
 -- Lifecycle
@@ -180,15 +205,13 @@ newBrokerEnv cfg nodeId peer = do
 
 -- | Start the broker's green thread.
 startBrokerThread :: BrokerEnv -> IO ()
-startBrokerThread env = do
-  tid <- forkIO (brokerThreadMain env)
-  writeIORef (beThread env) (Just tid)
+startBrokerThread env = void $ forkIO (brokerThreadMain env)
 
 -- | Request clean shutdown of the broker thread.
 stopBroker :: BrokerEnv -> IO ()
-stopBroker env = do
-  atomically $ writeTVar (beShutdown env) True
-  atomically $ writeTBQueue (beOps env) BrokerShutdown
+stopBroker env = atomically $ do
+  writeTVar (beShutdown env) True
+  writeTBQueue (beOps env) BrokerShutdown
 
 ------------------------------------------------------------------------
 -- Public: enqueue operations
@@ -200,7 +223,7 @@ enqueueProduce :: BrokerEnv -> TopicName -> Int32 -> ByteArray
               -> IO (TMVar (Either KafkaException ()))
 enqueueProduce env topic part payload = do
   result <- newEmptyTMVarIO
-  let msg = PendingMessage payload result
+  let msg = PendingMessage payload result (ccRetries (beConfig env))
   atomically $ writeTBQueue (beOps env) (BrokerProduce topic part msg)
   pure result
 
@@ -240,25 +263,14 @@ brokerThreadMain env = do
       brokerThreadMain env
 
 -- | Run a single broker session (one TCP connection lifetime).
--- Spawns a receiver thread and runs the sender loop.
--- When either fails, the session ends and we reconnect.
+-- Races sender and receiver — when either exits (normally or via
+-- exception), the other is cancelled. This mirrors librdkafka's
+-- single-thread poll() loop, but uses two green threads since GHC's
+-- IO manager makes blocking send/recv transparent.
 runBrokerSession :: BrokerEnv -> Kafka -> IO ()
 runBrokerSession env kafka = do
-  -- Handshake: send ApiVersions to discover broker capabilities
   performHandshake env kafka
-
-  -- Main loop: sender + receiver threads
-  senderTid <- myThreadId
-  recvTid <- forkIO $ do
-    r <- try (receiverLoop env kafka)
-    case r of
-      Left (e :: SomeException) -> throwTo senderTid e
-      Right _ -> pure ()
-  r <- try (senderLoop env kafka)
-  killThread recvTid
-  case r of
-    Left (e :: SomeException) -> throwTo senderTid e >> error "unreachable"
-    Right a -> pure a
+  race_ (senderLoop env kafka) (receiverLoop env kafka)
 
 ------------------------------------------------------------------------
 -- Connection handshake
@@ -366,26 +378,50 @@ data SenderEvent = OpEvent !BrokerOp | LingerFired
 -- Groups messages by (topic, partition), builds a ProduceRequest for
 -- each group, assigns correlation IDs, and sends.
 flushBatch :: BrokerEnv -> Kafka -> Batch -> IO ()
-flushBatch env kafka batch = do
-  let groups = Map.toList (batchGroups batch)
-  mapM_ (sendPartitionBatch env kafka) groups
+flushBatch env kafka batch =
+  Map.foldlWithKey' (\act k v -> act >> sendPartitionBatch env kafka (k, v))
+    (pure ()) (batchGroups batch)
 
 -- | Send a batch for a single (topic, partition) group.
+-- Blocks via STM if in-flight request count is at the limit.
+-- When idempotent state is set, uses produceRequestIdempotent with
+-- per-partition sequence numbers.
 sendPartitionBatch :: BrokerEnv -> Kafka -> ((TopicName, Int32), [PendingMessage]) -> IO ()
 sendPartitionBatch env kafka ((topic, part), msgsRev) = do
   let msgs = reverse msgsRev
       payloads = messagesToPayloadArray msgs
       timeoutMs = ccRequestTimeoutMs (beConfig env)
       cfg = beConfig env
-      reqBytes = produceRequest
+      msgCount = length msgs
+
+  -- Determine idempotent state (PID/epoch/sequence) if set
+  mIdemp <- readIORef (beIdempotent env)
+  (pid, epoch, baseSeq) <- case mIdemp of
+    Nothing -> pure (-1, -1, -1)
+    Just (IdempotentRef p e seqsVar) -> do
+      s <- modifyMVar seqsVar $ \seqMap ->
+        let key = (topic, part)
+            curSeq = Map.findWithDefault 0 key seqMap
+            nextSeq = curSeq + fromIntegral msgCount
+        in pure (Map.insert key nextSeq seqMap, curSeq)
+      pure (p, e, s)
+
+  let reqBytes = produceRequestCompressed
         (acksToInt16 (ccAcks cfg))
         (ccClientId cfg)
-        timeoutMs topic part payloads
+        timeoutMs topic part pid epoch baseSeq
+        (ccCompression cfg) payloads
+
+  -- Wait for in-flight slot (blocks if at ccMaxInFlight)
+  atomically $ do
+    count <- readTVar (beInflightCount env)
+    check (count < ccMaxInFlight cfg)
+    writeTVar (beInflightCount env) (count + 1)
 
   corrId <- nextCorrId (beCorrCounter env)
   let patched = patchCorrelationIdLBS corrId reqBytes
 
-  let callbacks = [(part, fmap pmResult msgs)]
+  let callbacks = [(part, msgs)]
   atomically $ modifyTVar' (beInflight env) $
     IM.insert (fromIntegral corrId) (InflightBatch topic callbacks)
 
@@ -393,8 +429,10 @@ sendPartitionBatch env kafka ((topic, part), msgsRev) = do
   case result of
     Left err -> do
       let kafkaErr = Left (KafkaIOError (show err))
-      mapM_ (\m -> atomically $ void $ tryPutTMVar (pmResult m) kafkaErr) msgs
-      atomically $ modifyTVar' (beInflight env) $ IM.delete (fromIntegral corrId)
+      atomically $ do
+        forM_ msgs $ \m -> void $ tryPutTMVar (pmResult m) kafkaErr
+        modifyTVar' (beInflight env) $ IM.delete (fromIntegral corrId)
+        modifyTVar' (beInflightCount env) (subtract 1)
     Right () -> pure ()
 
 -- | Build an UnliftedArray ByteArray from pending message payloads.
@@ -425,9 +463,9 @@ sendRawRequest env kafka reqBytes respVar = do
 
   result <- try @IOException $ NBSL.sendAll (getSocket kafka) patched
   case result of
-    Left err -> do
-      atomically $ void $ tryPutTMVar respVar (Left (KafkaIOError (show err)))
-      atomically $ modifyTVar' (beInflight env) $ IM.delete (fromIntegral corrId)
+    Left err -> atomically $ do
+      void $ tryPutTMVar respVar (Left (KafkaIOError (show err)))
+      modifyTVar' (beInflight env) $ IM.delete (fromIntegral corrId)
     Right () -> pure ()
 
 ------------------------------------------------------------------------
@@ -450,6 +488,8 @@ receiverLoop env kafka = do
         receiverLoop env kafka
 
 -- | Extract correlation ID from response and dispatch to the waiting caller.
+-- For produce responses, parses error codes per partition and retries
+-- on retriable errors if retries remain.
 dispatchResponse :: BrokerEnv -> ByteArray -> IO ()
 dispatchResponse env responseBytes = do
   let corrId = extractCorrelationId responseBytes
@@ -464,12 +504,56 @@ dispatchResponse env responseBytes = do
     Nothing -> pure ()  -- orphaned response, ignore
     Just (InflightRaw respVar) ->
       void $ atomically $ tryPutTMVar respVar (Right responseBytes)
-    Just (InflightBatch _topic callbacks) ->
-      -- For now, assume success if we got a response.
-      -- TODO: parse ProduceResponse and check per-partition error codes
-      mapM_ (\(_part, tmvars) ->
-        mapM_ (\tv -> atomically $ tryPutTMVar tv (Right ())) tmvars
-      ) callbacks
+    Just (InflightBatch topic callbacks) -> do
+      -- Decrement in-flight count
+      atomically $ modifyTVar' (beInflightCount env) (subtract 1)
+      -- Parse the ProduceResponse to get per-partition error codes
+      case Smith.parseByteArray parseProduceResponseV9 responseBytes of
+        Smith.Failure _parseErr ->
+          -- Parse failed — report error to all callbacks
+          let err = Left (KafkaParseException "failed to parse ProduceResponse")
+          in atomically $ forM_ callbacks $ \(_part, msgs) ->
+               forM_ msgs $ \m -> void $ tryPutTMVar (pmResult m) err
+        Smith.Success (Smith.Slice _ _ prodResp) ->
+          dispatchProduceResponse env topic callbacks prodResp
+
+-- | Dispatch a parsed ProduceResponse to the waiting callbacks.
+-- Matches partition responses to callbacks and handles errors.
+dispatchProduceResponse :: BrokerEnv
+                       -> TopicName
+                       -> [(Int32, [PendingMessage])]
+                       -> ProduceResponse
+                       -> IO ()
+dispatchProduceResponse env topic callbacks prodResp = do
+  -- Build a map of partition → error code from the response
+  let partErrors = Map.fromList
+        [ (prResponsePartition pr, prResponseErrorCode pr)
+        | msg <- produceResponseMessages prodResp
+        , pr  <- prPartitionResponses msg
+        ]
+  forM_ callbacks $ \(part, msgs) ->
+    case Map.lookup part partErrors of
+      -- No entry or error code 0 → success
+      Nothing     -> completeAll msgs (Right ())
+      Just 0      -> completeAll msgs (Right ())
+      Just errCode -> case fromErrorCode errCode of
+        Nothing ->
+          completeAll msgs (Left (KafkaUnexpectedErrorCodeException errCode))
+        Just protoErr
+          | isRetriable protoErr ->
+              -- Retriable: re-enqueue individually (writeTBQueue may block,
+              -- so we can't batch with tryPutTMVar in one transaction)
+              forM_ msgs $ \m ->
+                if pmRetriesLeft m > 0
+                  then atomically $ writeTBQueue (beOps env)
+                    (BrokerProduce topic part m { pmRetriesLeft = pmRetriesLeft m - 1 })
+                  else atomically $ void $ tryPutTMVar (pmResult m)
+                    (Left (KafkaProtocolException protoErr))
+          | otherwise ->
+              completeAll msgs (Left (KafkaProtocolException protoErr))
+  where
+    completeAll msgs result = atomically $
+      forM_ msgs $ \m -> void $ tryPutTMVar (pmResult m) result
 
 ------------------------------------------------------------------------
 -- Failure handling
@@ -481,16 +565,15 @@ failAllInflight env = do
   entries <- atomically $ do
     m <- readTVar (beInflight env)
     writeTVar (beInflight env) IM.empty
+    writeTVar (beInflightCount env) 0
     pure m
-  let err = KafkaException "broker connection lost"
-  mapM_ (failEntry err) (IM.elems entries)
-  where
-    failEntry err (InflightRaw respVar) =
-      void $ atomically $ tryPutTMVar respVar (Left err)
-    failEntry err (InflightBatch _ callbacks) =
-      mapM_ (\(_, tmvars) ->
-        mapM_ (\tv -> void $ atomically $ tryPutTMVar tv (Left err)) tmvars
-      ) callbacks
+  let err = Left (KafkaException "broker connection lost")
+  atomically $ forM_ (IM.elems entries) $ \case
+    InflightRaw respVar ->
+      void $ tryPutTMVar respVar err
+    InflightBatch _ callbacks ->
+      forM_ callbacks $ \(_, msgs) ->
+        forM_ msgs $ \m -> void $ tryPutTMVar (pmResult m) err
 
 ------------------------------------------------------------------------
 -- Correlation ID

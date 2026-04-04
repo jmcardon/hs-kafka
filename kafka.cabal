@@ -57,6 +57,7 @@ library
     -Wall
     -O2
   build-depends:
+    , async             >= 2.2
     , base              >= 4.16
     , byteslice         >= 0.2
     , bytesmith         >= 0.3
@@ -71,6 +72,10 @@ library
     , proto3-wire       >= 1.4
     , stm               >= 2.5
     , transformers      >= 0.5
+    , lz4               >= 0.2
+    , snappy            >= 0.2
+    , zlib              >= 0.6
+    , zstd              >= 0.1
   hs-source-dirs:
     src
   default-language:
@@ -83,6 +88,7 @@ test-suite unit
   build-depends:
     , base
     , bytesmith
+    , byteslice
     , bytestring
     , containers
     , kafka
@@ -100,6 +106,7 @@ test-suite integration
   other-modules:    MockCluster
   hs-source-dirs:   test
   build-depends:
+    , async
     , base
     , bytestring
     , kafka
@@ -117,3 +124,29 @@ test-suite integration
     include-dirs:     /usr/include /usr/include/librdkafka
   default-language: GHC2024
   ghc-options:      -Wall -O2 -threaded
+
+benchmark throughput
+  type:             exitcode-stdio-1.0
+  main-is:          Benchmark.hs
+  other-modules:    MockCluster
+  hs-source-dirs:   bench test
+  build-depends:
+    , base
+    , bytestring
+    , criterion
+    , deepseq
+    , hw-kafka-client
+    , kafka
+    , network
+    , primitive
+    , stm
+    , text
+  extra-libraries:  rdkafka
+  if os(darwin)
+    extra-lib-dirs:   /opt/homebrew/lib
+    include-dirs:     /opt/homebrew/include
+  if os(linux)
+    extra-lib-dirs:   /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu
+    include-dirs:     /usr/include /usr/include/librdkafka
+  default-language: GHC2024
+  ghc-options:      -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"

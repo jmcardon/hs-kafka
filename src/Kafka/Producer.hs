@@ -15,8 +15,13 @@
 --   - Correlation ID tracking and response dispatch (Phase 2)
 --   - Reconnection with exponential backoff + jitter (Phase 6)
 --   - Backpressure via bounded TBQueues (Phase 7)
+--
+-- Supports idempotent production (Phase 9) when ccIdempotent=True:
+--   - Obtains ProducerId via InitProducerId API on startup
+--   - Tracks per-partition sequence numbers for exactly-once delivery
 module Kafka.Producer
   ( KafkaProducer(..)
+  , IdempotentState(..)
   , newProducer
   , closeProducer
   , produce
@@ -26,30 +31,45 @@ module Kafka.Producer
 
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
 import Control.Concurrent.STM
-import Data.Int (Int32)
-import Data.IntMap.Strict (IntMap)
-import qualified Data.IntMap.Strict as IM
-import Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
+import Data.Int (Int32, Int64, Int16)
+import Data.IORef (IORef, newIORef, atomicModifyIORef')
 import Data.Map.Strict (Map)
 import Data.Primitive.ByteArray (ByteArray)
 
+import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
+import qualified Data.Bytes.Parser as Smith
 
 import Kafka.Common
 import Kafka.Client
-import Kafka.Internal.Broker (enqueueProduce, BrokerOp(..), BrokerEnv(..))
+import Kafka.Internal.Broker (enqueueProduce, enqueueRequest, BrokerOp(..), BrokerEnv(..),
+  setIdempotentState)
 import Kafka.Internal.Config
+import Kafka.Internal.InitProducerId.Request (initProducerIdRequest)
+import Kafka.Internal.InitProducerId.Response (InitProducerIdResponse(..),
+  parseInitProducerIdResponseV4)
 
 ------------------------------------------------------------------------
 -- Types
 ------------------------------------------------------------------------
 
+-- | Idempotent producer state (Phase 9).
+-- When ccIdempotent=True, this is populated on startup via InitProducerId.
+data IdempotentState = IdempotentState
+  { isProducerId    :: {-# UNPACK #-} !Int64
+  , isProducerEpoch :: {-# UNPACK #-} !Int16
+  , isSequences     :: !(MVar (Map (TopicName, Int32) Int32))
+    -- ^ Per-(topic, partition) next sequence number.
+  }
+
 data KafkaProducer = KafkaProducer
-  { kpClient   :: !KafkaClient
-  , kpCounters :: !(MVar (Map TopicName (IORef Int)))
+  { kpClient      :: !KafkaClient
+  , kpCounters    :: !(MVar (Map TopicName (IORef Int)))
     -- ^ Per-topic round-robin partition counters.
     -- MVar protects the map; IORef per-topic is contention-free.
-  , kpConfig   :: !ClientConfig
+  , kpConfig      :: !ClientConfig
+  , kpIdempotent  :: !(Maybe IdempotentState)
+    -- ^ Populated when ccIdempotent=True.
   }
 
 ------------------------------------------------------------------------
@@ -59,14 +79,59 @@ data KafkaProducer = KafkaProducer
 -- | Create a new producer backed by a 'KafkaClient'.
 --
 -- The client must already be created and connected.
-newProducer :: KafkaClient -> ClientConfig -> IO KafkaProducer
+-- If ccIdempotent is True, sends InitProducerId to obtain a PID.
+newProducer :: KafkaClient -> ClientConfig -> IO (Either KafkaException KafkaProducer)
 newProducer client cfg = do
   counters <- newMVar Map.empty
-  pure KafkaProducer
-    { kpClient   = client
-    , kpCounters = counters
-    , kpConfig   = cfg
-    }
+  if ccIdempotent cfg
+    then do
+      idempResult <- initIdempotentState client
+      case idempResult of
+        Left err -> pure (Left err)
+        Right idemState -> do
+          -- Set idempotent state on all existing broker envs
+          brokers <- readTVarIO (kcBrokers client)
+          mapM_ (\env -> setIdempotentState env
+            (isProducerId idemState) (isProducerEpoch idemState) (isSequences idemState))
+            (IM.elems brokers)
+          pure $ Right KafkaProducer
+            { kpClient     = client
+            , kpCounters   = counters
+            , kpConfig     = cfg
+            , kpIdempotent = Just idemState
+            }
+    else pure $ Right KafkaProducer
+      { kpClient     = client
+      , kpCounters   = counters
+      , kpConfig     = cfg
+      , kpIdempotent = Nothing
+      }
+
+-- | Obtain a ProducerId via InitProducerId API.
+initIdempotentState :: KafkaClient -> IO (Either KafkaException IdempotentState)
+initIdempotentState client = do
+  mBroker <- anyBroker client
+  case mBroker of
+    Nothing -> pure (Left (KafkaException "no broker available for InitProducerId"))
+    Just env -> do
+      let reqBytes = initProducerIdRequest Nothing 30000
+      respVar <- enqueueRequest env reqBytes
+      response <- atomically $ readTMVar respVar
+      case response of
+        Left err -> pure (Left err)
+        Right bytes ->
+          case Smith.parseByteArray parseInitProducerIdResponseV4 bytes of
+            Smith.Failure e -> pure (Left (KafkaParseException e))
+            Smith.Success (Smith.Slice _ _ resp)
+              | ipErrorCode resp /= 0 ->
+                  pure (Left (KafkaUnexpectedErrorCodeException (ipErrorCode resp)))
+              | otherwise -> do
+                  seqs <- newMVar Map.empty
+                  pure $ Right IdempotentState
+                    { isProducerId    = ipProducerId resp
+                    , isProducerEpoch = ipProducerEpoch resp
+                    , isSequences     = seqs
+                    }
 
 -- | Close the producer. Does NOT close the underlying 'KafkaClient'.
 closeProducer :: KafkaProducer -> IO ()
@@ -129,7 +194,7 @@ flushProducer :: KafkaProducer -> IO ()
 flushProducer producer = do
   brokers <- readTVarIO (kcBrokers (kpClient producer))
   doneVars <- mapM flushOne (IM.elems brokers)
-  mapM_ (\v -> atomically $ readTMVar v) doneVars
+  atomically $ mapM_ readTMVar doneVars
   where
     flushOne env = do
       done <- newEmptyTMVarIO
@@ -177,3 +242,4 @@ nextPartition producer topic count = do
   atomicModifyIORef' ref $ \n ->
     let n' = if n + 1 >= fromIntegral count then 0 else n + 1
     in (n', fromIntegral n)
+

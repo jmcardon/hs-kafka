@@ -1,1 +1,24 @@
 packages: .
+
+benchmarks: True
+
+source-repository-package
+  type: git
+  location: https://github.com/jmcardon/hw-kafka-client.git
+  tag: 71444f399ff3c75cc36047b3faab35623113d720
+
+package hw-kafka-client
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include
+
+package snappy
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include
+
+package lz4
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include
+
+package zstd
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include
