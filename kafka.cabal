@@ -42,6 +42,7 @@ library
     Kafka.Internal.OffsetFetch.Response
     Kafka.Internal.Produce.Request
     Kafka.Internal.Produce.Response
+    Kafka.Internal.RecordBatch
     Kafka.Internal.Reconnect
     Kafka.Internal.Request
     Kafka.Internal.Request.Types
@@ -63,8 +64,8 @@ library
     , byteslice         >= 0.2
     , bytesmith         >= 0.3
     , bytestring        >= 0.11
-    , castagnoli        >= 0.2
     , containers        >= 0.6
+    , digest            >= 0.0.2
     , contiguous        >= 0.5
     , mtl               >= 2.2
     , network           >= 3.1
