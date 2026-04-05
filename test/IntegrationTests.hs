@@ -7,7 +7,6 @@ import Control.Concurrent.STM
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef
-import Data.Primitive.ByteArray (ByteArray, byteArrayFromListN)
 import Test.Tasty
 import Test.Tasty.HUnit
 
@@ -115,9 +114,6 @@ clientTests = testGroup "Client"
 -- Producer tests
 ------------------------------------------------------------------------
 
--- | Helper: ByteString to ByteArray for payloads
-bsToBA :: ByteString -> ByteArray
-bsToBA bs = byteArrayFromListN (BS.length bs) (BS.unpack bs)
 
 producerTests :: TestTree
 producerTests = testGroup "Producer"
@@ -125,7 +121,7 @@ producerTests = testGroup "Producer"
       withMockCluster 1 $ \mc -> do
         mockCreateTopic mc "produce-test" 1 1
         withTestProducer mc defaultConfig $ \_client producer -> do
-          result <- produce producer "produce-test" (bsToBA "hello kafka")
+          result <- produce producer "produce-test" ("hello kafka")
           case result of
             Left err -> assertFailure ("produce failed: " ++ show err)
             Right () -> pure ()
@@ -136,7 +132,7 @@ producerTests = testGroup "Producer"
         withTestProducer mc defaultConfig $ \_client producer -> do
           results <- mapM (\i ->
             produce producer "bulk-test"
-              (bsToBA (BS.pack [fromIntegral (i :: Int)])))
+              ((BS.pack [fromIntegral (i :: Int)])))
             [0..99]
           let failures = filter isLeft results
           assertEqual "all should succeed" 0 (length failures)
@@ -149,7 +145,7 @@ producerTests = testGroup "Producer"
           -- Fire-and-forget 10 messages
           vars <- mapM (\i ->
             produceAsync producer "async-test"
-              (bsToBA (BS.pack [fromIntegral (i :: Int)])))
+              ((BS.pack [fromIntegral (i :: Int)])))
             [0..9]
           -- Flush forces them out despite high linger
           flushProducer producer
@@ -165,7 +161,7 @@ producerTests = testGroup "Producer"
           -- Produce 12 messages — should round-robin across 4 partitions
           results <- mapM (\i ->
             produce producer "multi-part"
-              (bsToBA (BS.pack [fromIntegral (i :: Int)])))
+              ((BS.pack [fromIntegral (i :: Int)])))
             [0..11]
           let failures = filter isLeft results
           assertEqual "all should succeed" 0 (length failures)
@@ -179,7 +175,7 @@ producerTests = testGroup "Producer"
           failCount <- newIORef (0 :: Int)
           vars <- mapM (\i ->
             produceAsync producer "callback-test"
-              (bsToBA (BS.pack [fromIntegral (i :: Int)])))
+              ((BS.pack [fromIntegral (i :: Int)])))
             [0..49]
           flushProducer producer
           -- Process callbacks
@@ -201,7 +197,7 @@ producerTests = testGroup "Producer"
         withTestProducer mc cfg $ \_client producer -> do
           vars <- mapM (\i ->
             produceAsync producer "rapid-test"
-              (bsToBA (BS.pack [fromIntegral (i `mod` 256 :: Int)])))
+              ((BS.pack [fromIntegral (i `mod` 256 :: Int)])))
             [0..999]
           flushProducer producer
           results <- mapM (atomically . readTMVar) vars
@@ -225,7 +221,7 @@ compressionTests = testGroup "Compression"
         let cfg = defaultConfig { ccCompression = Gzip }
         withTestProducer mc cfg $ \_client producer -> do
           -- Tiny payload — compression won't help, should fall back to uncompressed
-          result <- produce producer "small-comp" (bsToBA "x")
+          result <- produce producer "small-comp" ("x")
           case result of
             Left err -> assertFailure ("produce failed: " ++ show err)
             Right () -> pure ()
@@ -240,7 +236,7 @@ compressionProduceTest name codec tn = testCase ("produce with " ++ name) $
     mockCreateTopic mc topic 1 1
     let cfg = defaultConfig { ccCompression = codec }
     withTestProducer mc cfg $ \_client producer -> do
-      let payload = bsToBA (BS.concat (replicate 20 "repetitive data for compression test "))
+      let payload = (BS.concat (replicate 20 "repetitive data for compression test "))
       results <- mapM (\_ -> produce producer tn payload) [1..10 :: Int]
       let failures = filter isLeft results
       assertEqual ("all should succeed with " ++ name) 0 (length failures)
@@ -254,7 +250,7 @@ errorHandlingTests = testGroup "Error handling"
   [ testCase "produce to non-existent topic reports error" $
       withMockCluster 1 $ \mc ->
         withTestProducer mc defaultConfig $ \_client producer -> do
-          result <- produce producer "nonexistent-topic" (bsToBA "test")
+          result <- produce producer "nonexistent-topic" ("test")
           case result of
             Left _ -> pure ()  -- Expected: error because topic doesn't exist
             Right () -> pure ()  -- Mock cluster may auto-create
@@ -280,7 +276,7 @@ errorHandlingTests = testGroup "Error handling"
                 assertFailure ("newProducer failed: " ++ show err)
               Right producer -> do
                 -- Produce some messages first
-                r1 <- produce producer "disconnect-test" (bsToBA "before disconnect")
+                r1 <- produce producer "disconnect-test" ("before disconnect")
                 case r1 of
                   Left err -> assertFailure ("first produce failed: " ++ show err)
                   Right () -> pure ()
@@ -292,7 +288,7 @@ errorHandlingTests = testGroup "Error handling"
                 threadDelay 500000  -- 500ms for reconnection
 
                 -- Should be able to produce again
-                r2 <- produce producer "disconnect-test" (bsToBA "after reconnect")
+                r2 <- produce producer "disconnect-test" ("after reconnect")
                 case r2 of
                   Left _ -> pure ()  -- May fail if reconnection not complete
                   Right () -> pure ()
@@ -363,7 +359,7 @@ multiBrokerTests = testGroup "Multi-broker"
         withTestProducer mc defaultConfig $ \_client producer -> do
           results <- mapM (\i ->
             produce producer "multi-broker-test"
-              (bsToBA (BS.pack [fromIntegral (i :: Int)])))
+              ((BS.pack [fromIntegral (i :: Int)])))
             [0..59]
           let failures = filter isLeft results
           assertEqual "all 60 should succeed" 0 (length failures)
@@ -373,7 +369,7 @@ multiBrokerTests = testGroup "Multi-broker"
         mockCreateTopic mc "failover-test" 1 3
         withTestProducer mc defaultConfig { ccRetries = 5 } $ \client producer -> do
           -- Produce succeeds initially
-          r1 <- produce producer "failover-test" (bsToBA "before-failover")
+          r1 <- produce producer "failover-test" ("before-failover")
           case r1 of
             Left err -> assertFailure ("first produce failed: " ++ show err)
             Right () -> pure ()
@@ -386,7 +382,7 @@ multiBrokerTests = testGroup "Multi-broker"
           threadDelay 200000  -- 200ms settle
 
           -- Should succeed on the new leader
-          r2 <- produce producer "failover-test" (bsToBA "after-failover")
+          r2 <- produce producer "failover-test" ("after-failover")
           case r2 of
             Left err -> assertFailure ("produce after failover failed: " ++ show err)
             Right () -> pure ()
@@ -406,7 +402,7 @@ retriableErrorTests = testGroup "Retriable errors"
         mockPushRequestErrors mc 0 [6, 6]  -- API key 0 = Produce
         let cfg = defaultConfig { ccRetries = 3 }
         withTestProducer mc cfg $ \_client producer -> do
-          result <- produce producer "retry-test" (bsToBA "should-retry")
+          result <- produce producer "retry-test" ("should-retry")
           case result of
             Left err -> assertFailure ("produce should have succeeded after retries: " ++ show err)
             Right () -> pure ()
@@ -418,7 +414,7 @@ retriableErrorTests = testGroup "Retriable errors"
         mockPushRequestErrors mc 0 [21]  -- INVALID_REQUIRED_ACKS
         let cfg = defaultConfig { ccRetries = 3 }
         withTestProducer mc cfg $ \_client producer -> do
-          result <- produce producer "noretry-test" (bsToBA "should-fail")
+          result <- produce producer "noretry-test" ("should-fail")
           case result of
             Left _ -> pure ()  -- Expected failure
             Right () -> pure ()  -- Mock cluster may handle differently
@@ -430,7 +426,7 @@ retriableErrorTests = testGroup "Retriable errors"
         mockPushRequestErrors mc 0 [6, 6, 6, 6, 6]
         let cfg = defaultConfig { ccRetries = 2 }
         withTestProducer mc cfg $ \_client producer -> do
-          result <- produce producer "exhaust-test" (bsToBA "will-exhaust")
+          result <- produce producer "exhaust-test" ("will-exhaust")
           case result of
             Left _ -> pure ()  -- Expected: retries exhausted
             Right () -> pure ()  -- Mock may absorb errors differently
@@ -450,7 +446,7 @@ backpressureTests = testGroup "Backpressure"
           -- Fire 500 async messages — should not block
           vars <- mapM (\i ->
             produceAsync producer "bp-test"
-              (bsToBA (BS.pack [fromIntegral (i `mod` 256 :: Int)])))
+              ((BS.pack [fromIntegral (i `mod` 256 :: Int)])))
             [0..499]
           flushProducer producer
           results <- mapM (atomically . readTMVar) vars
@@ -469,7 +465,7 @@ backpressureTests = testGroup "Backpressure"
         withTestProducer mc cfg $ \_client producer -> do
           vars <- mapM (\i ->
             produceAsync producer "hv-test"
-              (bsToBA (BS.pack [fromIntegral (i `mod` 256 :: Int)])))
+              ((BS.pack [fromIntegral (i `mod` 256 :: Int)])))
             [0..199]
           flushProducer producer
           results <- mapM (atomically . readTMVar) vars
@@ -486,7 +482,7 @@ backpressureTests = testGroup "Backpressure"
           -- Should still succeed despite latency
           results <- mapM (\i ->
             produce producer "rtt-test"
-              (bsToBA (BS.pack [fromIntegral (i :: Int)])))
+              ((BS.pack [fromIntegral (i :: Int)])))
             [0..9]
           let failures = filter isLeft results
           assertEqual "all should succeed despite RTT" 0 (length failures)

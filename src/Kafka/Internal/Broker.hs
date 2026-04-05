@@ -48,14 +48,13 @@ import Data.IORef
 import Data.Int (Int16, Int32, Int64)
 import Data.Map.Strict (Map)
 import Data.ByteString (ByteString)
-import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
-import Data.Primitive.Unlifted.Array
 import Numeric.Natural (Natural)
 
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
+import qualified Network.Socket.ByteString as NBS
 import qualified Network.Socket.ByteString.Lazy as NBSL
 
 import Kafka.Common
@@ -63,7 +62,7 @@ import Kafka.Internal.ApiVersions.Request (apiVersionsRequest)
 import Kafka.Internal.ApiVersions.Response (ApiVersionsResponse(..), ApiVersionEntry(..),
   parseApiVersionsResponse)
 import Kafka.Internal.Config
-import Kafka.Internal.Produce.Request (produceRequestCompressed)
+import Kafka.Internal.Produce.Request (buildProduceRequest)
 import Kafka.Internal.Produce.Response (ProduceResponse(..), ProduceResponseMessage(..),
   ProducePartitionResponse(..), parseProduceResponseV9)
 import Kafka.Internal.Reconnect
@@ -79,7 +78,7 @@ data BrokerState = BrokerInit | BrokerDown | BrokerConnecting | BrokerUp
 
 -- | A message waiting to be batched and sent.
 data PendingMessage = PendingMessage
-  { pmPayload     :: !ByteArray
+  { pmPayload     :: !ByteString
   , pmResult      :: !(TMVar (Either KafkaException ()))
   , pmRetriesLeft :: {-# UNPACK #-} !Int
   }
@@ -122,7 +121,7 @@ batchAdd :: Batch -> TopicName -> Int32 -> PendingMessage -> Batch
 batchAdd (Batch groups cnt bytes) topic part msg = Batch
   { batchGroups = Map.alter addMsg (topic, part) groups
   , batchCount  = cnt + 1
-  , batchBytes  = bytes + sizeofByteArray (pmPayload msg)
+  , batchBytes  = bytes + BS.length (pmPayload msg)
   }
   where
     addMsg Nothing    = Just [msg]
@@ -218,7 +217,7 @@ stopBroker env = atomically $ do
 
 -- | Enqueue a message for batched produce. Returns a TMVar that will
 -- be filled with the delivery result.
-enqueueProduce :: BrokerEnv -> TopicName -> Int32 -> ByteArray
+enqueueProduce :: BrokerEnv -> TopicName -> Int32 -> ByteString
               -> IO (TMVar (Either KafkaException ()))
 enqueueProduce env topic part payload = do
   result <- newEmptyTMVarIO
@@ -388,8 +387,6 @@ flushBatch env kafka batch =
 sendPartitionBatch :: BrokerEnv -> Kafka -> ((TopicName, Int32), [PendingMessage]) -> IO ()
 sendPartitionBatch env kafka ((topic, part), msgsRev) = do
   let msgs = reverse msgsRev
-      payloads = messagesToPayloadArray msgs
-      timeoutMs = ccRequestTimeoutMs (beConfig env)
       cfg = beConfig env
       msgCount = length msgs
 
@@ -405,26 +402,29 @@ sendPartitionBatch env kafka ((topic, part), msgsRev) = do
         in pure (Map.insert key nextSeq seqMap, curSeq)
       pure (p, e, s)
 
-  let reqBytes = produceRequestCompressed
-        (acksToInt16 (ccAcks cfg))
-        (ccClientId cfg)
-        timeoutMs topic part pid epoch baseSeq
-        (ccCompression cfg) payloads
-
   -- Wait for in-flight slot (blocks if at ccMaxInFlight)
   atomically $ do
     count <- readTVar (beInflightCount env)
     check (count < ccMaxInFlight cfg)
     writeTVar (beInflightCount env) (count + 1)
 
+  -- Get corrId and build the entire request as a strict ByteString
   corrId <- nextCorrId (beCorrCounter env)
-  let patched = patchCorrelationIdLBS corrId reqBytes
+  let !reqBytes = buildProduceRequest
+        corrId
+        (acksToInt16 (ccAcks cfg))
+        (ccClientId cfg)
+        (ccRequestTimeoutMs cfg)
+        topic part pid epoch baseSeq
+        (ccCompression cfg)
+        (map pmPayload msgs)
 
   let callbacks = [(part, msgs)]
   atomically $ modifyTVar' (beInflight env) $
     IM.insert (fromIntegral corrId) (InflightBatch topic callbacks)
 
-  result <- try @IOException $ NBSL.sendAll (getSocket kafka) patched
+  -- Send strict ByteString — single send() syscall
+  result <- try @IOException $ NBS.sendAll (getSocket kafka) reqBytes
   case result of
     Left err -> do
       let kafkaErr = Left (KafkaIOError (show err))
@@ -433,19 +433,6 @@ sendPartitionBatch env kafka ((topic, part), msgsRev) = do
         modifyTVar' (beInflight env) $ IM.delete (fromIntegral corrId)
         modifyTVar' (beInflightCount env) (subtract 1)
     Right () -> pure ()
-
--- | Build an UnliftedArray ByteArray from pending message payloads.
-messagesToPayloadArray :: [PendingMessage] -> UnliftedArray ByteArray
-messagesToPayloadArray msgs = runUnliftedArray $ do
-  let n = length msgs
-  arr <- newUnliftedArray n mempty
-  go arr 0 msgs
-  pure arr
-  where
-    go _ _ [] = pure ()
-    go arr !i (m:ms) = do
-      writeUnliftedArray arr i (pmPayload m)
-      go arr (i + 1) ms
 
 ------------------------------------------------------------------------
 -- Raw request send

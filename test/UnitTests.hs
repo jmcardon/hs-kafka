@@ -3,8 +3,7 @@
 module Main (main) where
 
 import Data.Int
-import Data.Primitive.ByteArray
-import Data.Primitive.Unlifted.Array
+import Data.Primitive.ByteArray (ByteArray, byteArrayFromList, sizeofByteArray)
 import Data.Word
 import Test.Tasty
 import Test.Tasty.Golden
@@ -13,8 +12,6 @@ import Test.Tasty.HUnit
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC8
 import qualified Data.ByteString.Lazy as BL
-import qualified Data.Bytes
-import Data.Bytes.Types (Bytes(Bytes))
 import qualified Data.IntMap as IM
 
 import Kafka.Common
@@ -24,7 +21,7 @@ import Kafka.Internal.Config (Compression(..))
 import Kafka.Internal.Fetch.Request
 import Kafka.Internal.JoinGroup.Request
 import Kafka.Internal.ListOffsets.Request
-import Kafka.Internal.Produce.Request
+import Kafka.Internal.Produce.Request (buildProduceRequest)
 import Kafka.Internal.Produce.Response
 import Kafka.Internal.Wire (Wire, runWire)
 import Kafka.Internal.Zigzag
@@ -226,7 +223,7 @@ errorCodeTests = testGroup "Error codes"
 compressionTests :: TestTree
 compressionTests = testGroup "Compression"
   [ testCase "NoCompression passthrough" $ do
-      let payload = fromByteString "hello world"
+      let payload = "hello world"
           (result, attr) = compressBatch NoCompression payload
       attr @?= 0
       result @?= payload
@@ -250,19 +247,15 @@ compressionTests = testGroup "Compression"
 compressionRoundTrip :: String -> Compression -> Int16 -> TestTree
 compressionRoundTrip name codec expectedAttr = testCase (name ++ " round-trips") $ do
   let rawBS = B.concat (replicate 100 "hello world, this is a test payload for compression. ")
-      payload = fromByteString rawBS
-      (compressed, attr) = compressBatch codec payload
+      (compressed, attr) = compressBatch codec rawBS
   attr @?= expectedAttr
-  let compressedBS = Data.Bytes.toByteString (Bytes compressed 0 (sizeofByteArray compressed))
-  case decompressBatch (fromIntegral attr) compressedBS of
+  case decompressBatch (fromIntegral attr) compressed of
     Left err -> assertFailure ("decompression failed: " ++ err)
     Right decompressed -> decompressed @?= rawBS
 
--- | Fallback test: tiny data should fall back to uncompressed (attr=0).
 compressionFallback :: String -> Compression -> TestTree
 compressionFallback name codec = testCase (name ++ " falls back for tiny data") $ do
-  let payload = fromByteString "hi"
-      (_, attr) = compressBatch codec payload
+  let (_, attr) = compressBatch codec "hi"
   attr @?= 0
 
 ------------------------------------------------------------------------
@@ -271,47 +264,24 @@ compressionFallback name codec = testCase (name ++ " falls back for tiny data") 
 
 idempotentProduceTests :: TestTree
 idempotentProduceTests = testGroup "Idempotent produce"
-  [ testCase "produceRequestIdempotent encodes PID in record batch" $ do
-      let payload = fromByteString "test message"
-          payloads = unliftedArrayFromList [payload]
-          req = produceRequestIdempotent
-            (-1)             -- acks=all
-            "kafka-native"   -- clientId
-            30000            -- timeout
-            "test-topic"     -- topic
-            0                -- partition
-            42               -- producerId
-            1                -- producerEpoch
-            0                -- baseSequence
-            payloads
-          reqBS = BL.toStrict req
-      -- The request should contain the producer ID (42) encoded as big-endian Int64
-      -- somewhere in the record batch section. Verify the request is non-empty.
-      assertBool "request should be non-empty" (B.length reqBS > 0)
-      -- Verify the request is different from non-idempotent (which uses -1 for PID)
-      let nonIdemReq = produceRequest (-1) "kafka-native" 30000 "test-topic" 0 payloads
-          nonIdemBS = BL.toStrict nonIdemReq
+  [ testCase "idempotent request encodes PID in record batch" $ do
+      let req = buildProduceRequest 0 (-1) "kafka-native" 30000
+                  "test-topic" 0 42 1 0 NoCompression ["test message"]
+      assertBool "request should be non-empty" (B.length req > 0)
+      let nonIdem = buildProduceRequest 0 (-1) "kafka-native" 30000
+                      "test-topic" 0 (-1) (-1) (-1) NoCompression ["test message"]
       assertBool "idempotent request should differ from non-idempotent"
-        (reqBS /= nonIdemBS)
-  , testCase "produceRequestCompressed with NoCompression matches produceRequest" $ do
-      let payload = fromByteString "test"
-          payloads = unliftedArrayFromList [payload]
-          compressed = produceRequestCompressed
-            1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression payloads
-          plain = produceRequest 1 "ruko" 30000 "test" 0 payloads
-      compressed @?= plain
-  , testCase "produceRequestCompressed with Gzip produces different bytes" $ do
-      let payload = fromByteString (B.concat (replicate 50 "repetitive data for compression "))
-          payloads = unliftedArrayFromList [payload]
-          compressed = produceRequestCompressed
-            1 "test" 30000 "test" 0 (-1) (-1) (-1) Gzip payloads
-          plain = produceRequestCompressed
-            1 "test" 30000 "test" 0 (-1) (-1) (-1) NoCompression payloads
-      assertBool "compressed request should differ from uncompressed"
-        (compressed /= plain)
-      -- Compressed should be shorter for repetitive data
-      assertBool "compressed request should be shorter"
-        (BL.length compressed < BL.length plain)
+        (req /= nonIdem)
+  , testCase "NoCompression is deterministic" $ do
+      let r1 = buildProduceRequest 0 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression ["test"]
+          r2 = buildProduceRequest 0 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression ["test"]
+      r1 @?= r2
+  , testCase "Gzip compression produces different (shorter) bytes" $ do
+      let payload = B.concat (replicate 50 "repetitive data for compression ")
+          compressed = buildProduceRequest 0 1 "test" 30000 "test" 0 (-1) (-1) (-1) Gzip [payload]
+          plain = buildProduceRequest 0 1 "test" 30000 "test" 0 (-1) (-1) (-1) NoCompression [payload]
+      assertBool "compressed should differ" (compressed /= plain)
+      assertBool "compressed should be shorter" (B.length compressed < B.length plain)
   ]
 
 goldenTests :: TestTree
@@ -366,24 +336,20 @@ goldenTests = testGroup "Golden tests"
       ]
   ]
 
--- Request modules now return BSL.ByteString, so golden tests use it directly.
+-- Produce golden tests use buildProduceRequest with corrId=0xbeef (legacy default).
 produceTest :: IO BL.ByteString
-produceTest = do
-  let payload = fromByteString "\"im not owned! im not owned!!\", i continue to insist as i slowlyshrink and transform into a corn cob"
-  payloads <- do
-    payloads <- newUnliftedArray 1 payload
-    freezeUnliftedArray payloads 0 1
-  pure (produceRequest 1 "ruko" 30000 "test" 0 payloads)
+produceTest = pure $ BL.fromStrict $ buildProduceRequest
+  0xbeef 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression
+  ["\"im not owned! im not owned!!\", i continue to insist as i slowlyshrink and transform into a corn cob"]
 
 multipleProduceTest :: IO BL.ByteString
-multipleProduceTest = do
-  let payloads = unliftedArrayFromList
-        [ fromByteString "i'm dying"
-        , fromByteString "is it blissful?"
-        , fromByteString "it's like a dream"
-        , fromByteString "i want to dream"
-        ]
-  pure (produceRequest 1 "ruko" 30000 "test" 0 payloads)
+multipleProduceTest = pure $ BL.fromStrict $ buildProduceRequest
+  0xbeef 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression
+  [ "i'm dying"
+  , "is it blissful?"
+  , "it's like a dream"
+  , "i want to dream"
+  ]
 
 fetchTest :: IO BL.ByteString
 fetchTest = pure (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0] 30000000)

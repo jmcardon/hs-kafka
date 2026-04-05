@@ -44,8 +44,6 @@ import Data.IntMap (IntMap)
 import Data.IORef (IORef, newIORef)
 import qualified Data.List as List
 import Data.Maybe
-import Data.Primitive.ByteArray (ByteArray, byteArrayFromListN)
-import Data.Word (Word8)
 import Network.Socket (HostName, ServiceName)
 import System.IO (Handle)
 
@@ -78,10 +76,6 @@ data Interruptedness
   = Interrupted
   | Uninterrupted
   deriving (Eq, Show)
-
--- | Convert ByteString to ByteArray (for old request types that still use ByteArray).
-bsToByteArray :: ByteString -> ByteArray
-bsToByteArray bs = byteArrayFromListN (BS.length bs) (BS.unpack bs :: [Word8])
 
 -- | This module provides a high-level interface to the Kafka API for
 -- consumers by wrapping the low-level request and response type modules.
@@ -541,7 +535,7 @@ join ::
 join kafka top member@(GroupMember name@(GroupName gid) _) handle = do
   ExceptT $ findCoordinator
     kafka
-    (FindCoordinatorRequest (bsToByteArray gid) 0)
+    (FindCoordinatorRequest gid 0)
     handle
   wait <- liftIO (registerDelay joinTimeout)
   -- Ignoring the response from FindCoordinator. Probably not

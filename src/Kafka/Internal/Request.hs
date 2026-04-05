@@ -16,6 +16,7 @@ module Kafka.Internal.Request
   ) where
 
 import Control.Exception (try, IOException)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as BSL
 import Data.IORef
 import qualified Network.Socket.ByteString.Lazy as NBSL
@@ -31,7 +32,8 @@ import Kafka.Internal.ListOffsets.Request
 import Kafka.Internal.Metadata.Request
 import Kafka.Internal.OffsetCommit.Request
 import Kafka.Internal.OffsetFetch.Request
-import Kafka.Internal.Produce.Request
+import Kafka.Internal.Config (Compression(..))
+import Kafka.Internal.Produce.Request (buildProduceRequest)
 import Kafka.Internal.Request.Types
 import Kafka.Internal.ShowDebug
 import Kafka.Internal.SyncGroup.Request
@@ -63,14 +65,10 @@ produce kafka req@ProduceRequest{..} handle = do
   logHandle handle (showDebug req)
   let Topic topicName parts ctr = produceTopic
   p <- fromIntegral <$> readIORef ctr
-  let message = produceRequest
-        1 -- acks=leader (legacy default)
-        clientId
-        (produceWaitTime `div` 1000)
-        topicName
-        p
-        producePayloads
-  request kafka message >>= \case
+  let message = buildProduceRequest
+        correlationId 1 clientId (produceWaitTime `div` 1000)
+        topicName p (-1) (-1) (-1) NoCompression producePayloads
+  request kafka (BSL.fromStrict message) >>= \case
     Left err -> pure (Left err)
     Right a -> do
       increment parts ctr
@@ -210,3 +208,4 @@ metadata kafka req@MetadataRequest{..} handle = do
   request kafka $ metadataRequest
     metadataTopic
     metadataAutoCreateTopic
+

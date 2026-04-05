@@ -33,8 +33,8 @@ import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
 import Control.Concurrent.STM
 import Data.Int (Int32, Int64, Int16)
 import Data.IORef (IORef, newIORef, atomicModifyIORef')
+import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
-import Data.Primitive.ByteArray (ByteArray)
 
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
@@ -147,7 +147,7 @@ closeProducer _ = pure ()
 --
 -- Partition selection is round-robin per topic.
 -- Batching happens transparently in the broker thread.
-produce :: KafkaProducer -> TopicName -> ByteArray -> IO (Either KafkaException ())
+produce :: KafkaProducer -> TopicName -> ByteString -> IO (Either KafkaException ())
 produce producer topic payload = do
   resultVar <- produceAsync producer topic payload
   atomically $ readTMVar resultVar
@@ -159,7 +159,7 @@ produce producer topic payload = do
 --   - Block:         atomically (readTMVar resultVar)
 --   - Fire-and-forget: discard the TMVar
 --   - Batch-wait:    collect multiple TMVars and wait on all
-produceAsync :: KafkaProducer -> TopicName -> ByteArray
+produceAsync :: KafkaProducer -> TopicName -> ByteString
             -> IO (TMVar (Either KafkaException ()))
 produceAsync producer topic payload = do
   -- Step 1: Ensure we have metadata for this topic

@@ -10,7 +10,6 @@ import Control.Concurrent.STM
 import Control.DeepSeq (NFData(..))
 import Criterion.Main
 import qualified Data.ByteString as BS
-import Data.Primitive.ByteArray (ByteArray, byteArrayFromListN)
 import qualified Data.Text as Text
 
 -- kafka-native
@@ -30,8 +29,6 @@ import MockCluster
 -- Helpers
 ------------------------------------------------------------------------
 
-bsToBA :: BS.ByteString -> ByteArray
-bsToBA bs = byteArrayFromListN (BS.length bs) (BS.unpack bs)
 
 ------------------------------------------------------------------------
 -- Environment setup
@@ -68,7 +65,7 @@ setupNative = do
   Right client <- Native.newClient cfg
   Right producer <- Native.newProducer client cfg
   -- warm up
-  _ <- Native.produce producer "native-bench" (bsToBA "warmup")
+  _ <- Native.produce producer "native-bench" ("warmup")
   Native.flushProducer producer
   pure (NativeEnv producer client mc)
 
@@ -114,7 +111,7 @@ mkHwRecord topic size = HW.ProducerRecord
 -- | Produce N messages with kafka-native, flush, wait for all callbacks.
 nativeProduce :: Native.KafkaProducer -> Int -> Int -> IO ()
 nativeProduce producer n size = do
-  let payload = bsToBA (BS.replicate size 0x41)
+  let payload = BS.replicate size 0x41
   vars <- mapM (\_ -> Native.produceAsync producer "native-bench" payload) [1..n]
   Native.flushProducer producer
   mapM_ (\v -> atomically $ readTMVar v) vars

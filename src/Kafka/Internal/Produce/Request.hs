@@ -1,22 +1,24 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Produce v9 request encoding.
+--
+-- The entire request is built as a single strict ByteString:
+--   1. Record batch built via RecordBatch (single pinned allocation)
+--   2. Protocol header written via Writer (BuildR, ~40 bytes)
+--   3. Assembled: size prefix + header + batch + tagged fields
+--
+-- Correlation ID is baked in from the start — no post-hoc patching.
 module Kafka.Internal.Produce.Request
-  ( produceRequest
-  , produceRequestIdempotent
-  , produceRequestCompressed
+  ( buildProduceRequest
   ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
-import Data.Bytes.Types (Bytes(Bytes))
-import qualified Data.Bytes
 import Data.Int (Int16, Int32, Int64)
-import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
-import Data.Primitive.Unlifted.Array (UnliftedArray, sizeofUnliftedArray)
 
-import Kafka.Common
+import Kafka.Common (TopicName(..), correlationId)
 import Kafka.Internal.Compression (compressBatch)
 import Kafka.Internal.Config (Compression(..))
 import Kafka.Internal.RecordBatch (buildRecordBatch, buildRecords, wrapRecordBatch)
@@ -28,37 +30,46 @@ produceApiVersion = 9
 produceApiKey :: Int16
 produceApiKey = 0
 
--- | Build a Produce v9 request.
+-- | Build a complete Produce v9 request as a strict ByteString.
 --
--- The record batch is built via RecordBatch (single pinned allocation).
--- For compression, records are built separately, compressed, then wrapped.
-buildProducePayload ::
-     Int16 -> ByteString -> Int -> TopicName -> Int32
-  -> Int64 -> Int16 -> Int32 -> Compression
-  -> UnliftedArray ByteArray -> BSL.ByteString
-buildProducePayload !acksVal !cid !timeout !topic !partition
+-- Correlation ID is baked in — no patching needed. The caller provides
+-- the corrId to use. Returns a strict ByteString ready for sendAll.
+buildProduceRequest ::
+     Int32           -- ^ correlation ID (baked in, not patched)
+  -> Int16           -- ^ acks
+  -> ByteString      -- ^ client ID
+  -> Int             -- ^ timeout (ms)
+  -> TopicName
+  -> Int32           -- ^ partition
+  -> Int64           -- ^ producerId (-1 for non-idempotent)
+  -> Int16           -- ^ producerEpoch (-1 for non-idempotent)
+  -> Int32           -- ^ baseSequence (-1 for non-idempotent)
+  -> Compression
+  -> [ByteString]    -- ^ message payloads
+  -> ByteString
+buildProduceRequest !corrId !acksVal !cid !timeout !topic !partition
     !producerId !producerEpoch !baseSeq !compression payloads =
   let
-    !n = sizeofUnliftedArray payloads
+    !n = length payloads
 
+    -- Build the record batch
     !batchBS = case compression of
       NoCompression ->
         buildRecordBatch producerId producerEpoch baseSeq 0 payloads
       _ ->
         let !rawRecords = buildRecords payloads
-            !rawRecordsBA = bsToBA rawRecords
-            (!compRecordsBA, !attr) = compressBatch compression rawRecordsBA
+            (!compRecords, !attr) = compressBatch compression rawRecords
         in if attr == 0
           then buildRecordBatch producerId producerEpoch baseSeq 0 payloads
-          else wrapRecordBatch producerId producerEpoch baseSeq attr n
-                 (baToBS compRecordsBA)
+          else wrapRecordBatch producerId producerEpoch baseSeq attr n compRecords
 
     !batchLen = BS.length batchBS
 
+    -- Protocol prefix with corrId baked in
     !prefixBuilder =
       int16 produceApiKey
       <> int16 produceApiVersion
-      <> int32 correlationId
+      <> int32 corrId
       <> string cid
       <> taggedFields
       <> compactNullableString Nothing
@@ -77,37 +88,5 @@ buildProducePayload !acksVal !cid !timeout !topic !partition
     !fullBody = prefixBytes <> BSL.fromStrict batchBS <> suffixBytes
     !bodySize = fromIntegral (BSL.length fullBody) :: Int32
 
-  in toLazyByteString (int32 bodySize) <> fullBody
-
--- Helpers for compression path (ByteArray ↔ ByteString).
--- These exist only because compressBatch still uses ByteArray.
-baToBS :: ByteArray -> ByteString
-baToBS ba = Data.Bytes.toByteString (Bytes ba 0 (sizeofByteArray ba))
-
-bsToBA :: ByteString -> ByteArray
-bsToBA = Data.Bytes.toByteArrayClone . Data.Bytes.fromByteString
-
--- | Non-idempotent, no compression.
-produceRequest ::
-     Int16 -> ByteString -> Int -> TopicName -> Int32
-  -> UnliftedArray ByteArray -> BSL.ByteString
-produceRequest acksVal cid timeout topic partition payloads =
-  buildProducePayload acksVal cid timeout topic partition
-    (-1) (-1) (-1) NoCompression payloads
-
--- | Idempotent, no compression.
-produceRequestIdempotent ::
-     Int16 -> ByteString -> Int -> TopicName -> Int32
-  -> Int64 -> Int16 -> Int32
-  -> UnliftedArray ByteArray -> BSL.ByteString
-produceRequestIdempotent acksVal cid timeout topic partition
-    producerId producerEpoch baseSeq payloads =
-  buildProducePayload acksVal cid timeout topic partition
-    producerId producerEpoch baseSeq NoCompression payloads
-
--- | With compression.
-produceRequestCompressed ::
-     Int16 -> ByteString -> Int -> TopicName -> Int32
-  -> Int64 -> Int16 -> Int32 -> Compression
-  -> UnliftedArray ByteArray -> BSL.ByteString
-produceRequestCompressed = buildProducePayload
+    -- Final: size prefix + body, materialized as strict ByteString
+  in BSL.toStrict (toLazyByteString (int32 bodySize) <> fullBody)

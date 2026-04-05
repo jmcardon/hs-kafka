@@ -7,8 +7,6 @@ module Kafka.Internal.Request.Types where
 import Data.ByteString (ByteString)
 import Data.Int (Int8, Int32)
 import Data.IORef (IORef)
-import Data.Primitive.ByteArray (ByteArray)
-import Data.Primitive.Unlifted.Array (UnliftedArray)
 import System.IO (Handle)
 
 import Kafka.Common
@@ -21,7 +19,7 @@ data ProduceRequest = ProduceRequest
     -- ^ current state of the topic we're producing to
   , produceWaitTime :: {-# UNPACK #-} !Int
     -- ^ number of microseconds to wait for response
-  , producePayloads :: !(UnliftedArray ByteArray)
+  , producePayloads :: [ByteString]
     -- ^ payloads
   }
 
@@ -76,7 +74,7 @@ instance ShowDebug JoinGroupRequest where
     ]
 
 data FindCoordinatorRequest = FindCoordinatorRequest
-  { findCoordinatorKey :: {-# UNPACK #-} !ByteArray
+  { findCoordinatorKey :: !ByteString
   , findCoordinatorKeyType :: {-# UNPACK #-} !Int8
   }
 
