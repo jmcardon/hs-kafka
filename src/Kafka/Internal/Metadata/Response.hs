@@ -3,20 +3,15 @@ module Kafka.Internal.Metadata.Response
   , MetadataBroker(..)
   , MetadataTopic(..)
   , MetadataPartition(..)
-  , getMetadataResponse
   , parseMetadataResponse
   , parseMetadataResponseV12
   ) where
 
-import Control.Concurrent.STM (TVar)
 import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32)
-import Data.Primitive.ByteArray (ByteArray)
-import System.IO (Handle)
 
-import Kafka.Internal.Combinator
-import Kafka.Common
-import Kafka.Internal.Response
+import Kafka.Common (TopicName(..))
+import Kafka.Internal.Wire
 
 data MetadataResponse = MetadataResponse
   { throttleTimeMs :: {-# UNPACK #-} !Int32
@@ -51,92 +46,98 @@ data MetadataPartition = MetadataPartition
   } deriving (Eq, Show)
 
 -- | Parse Metadata v7 response (legacy encoding).
-parseMetadataResponse :: Parser MetadataResponse
+parseMetadataResponse :: Wire MetadataResponse
 parseMetadataResponse = do
-  _correlationId <- int32 "correlation id"
-  MetadataResponse
-    <$> (int32 "throttle time")
-    <*> (array parseMetadataBrokerLegacy <?> "brokers")
-    <*> (fmap (fmap byteArrayToByteString) (nullableByteArray) <?> "cluster id")
-    <*> (int32 "controller id")
-    <*> (array parseMetadataTopicLegacy <?> "topics")
+  _correlationId <- int32
+  throttle <- int32
+  brokersL <- legacyArray parseMetadataBrokerLegacy
+  clId <- legacyNullableByteArray
+  ctrl <- int32
+  topicsL <- legacyArray parseMetadataTopicLegacy
+  pure (MetadataResponse throttle brokersL (fmap fst clId) ctrl topicsL)
+  where
+    legacyNullableByteArray = do
+      len <- int16
+      if len < 0
+        then pure Nothing
+        else Just <$> ((,()) <$> takeBytes (fromIntegral len))
 
-parseMetadataBrokerLegacy :: Parser MetadataBroker
+parseMetadataBrokerLegacy :: Wire MetadataBroker
 parseMetadataBrokerLegacy = do
-  nid <- int32 "node id"
-  h <- bytearray
-  p <- int32 "port"
-  r <- nullableByteArray
-  pure (MetadataBroker nid (byteArrayToByteString h) p (fmap byteArrayToByteString r))
+  nid <- int32
+  hLen <- int16
+  h <- takeBytes (fromIntegral hLen)
+  p <- int32
+  rLen <- int16
+  r <- if rLen < 0 then pure Nothing else Just <$> takeBytes (fromIntegral rLen)
+  pure (MetadataBroker nid h p r)
 
-parseMetadataTopicLegacy :: Parser MetadataTopic
+parseMetadataTopicLegacy :: Wire MetadataTopic
 parseMetadataTopicLegacy = do
-  ec <- int16 "error code"
-  tn <- topicName
-  internal <- bool "is internal"
-  parts <- array parseMetadataPartitionLegacy
-  pure (MetadataTopic ec tn internal parts)
+  ec <- int16
+  tLen <- int16
+  tn <- takeBytes (fromIntegral tLen)
+  internal <- parseBool
+  parts <- legacyArray parseMetadataPartitionLegacy
+  pure (MetadataTopic ec (TopicName tn) internal parts)
 
-parseMetadataPartitionLegacy :: Parser MetadataPartition
+parseMetadataPartitionLegacy :: Wire MetadataPartition
 parseMetadataPartitionLegacy = do
-  ec <- int16 "error code"
-  idx <- int32 "partition index"
-  leader <- int32 "leader id"
-  epoch <- int32 "leader epoch"
-  _replicas <- int32 "replica nodes"
-  _isrs <- int32 "isr nodes"
-  _offline <- int32 "offline replicas"
+  ec <- int16
+  idx <- int32
+  leader <- int32
+  epoch <- int32
+  _replicas <- int32  -- skip replica count (legacy)
+  _isrs <- int32      -- skip ISR count (legacy)
+  _offline <- int32   -- skip offline count (legacy)
   pure (MetadataPartition ec idx leader epoch [] [] [])
 
 -- | Parse Metadata v12+ response (flexible/compact encoding).
 -- Response header v1: correlation_id + tagged_fields (KIP-482).
-parseMetadataResponseV12 :: Parser MetadataResponse
+parseMetadataResponseV12 :: Wire MetadataResponse
 parseMetadataResponseV12 = do
-  _correlationId <- int32 "correlation id"
-  skipTaggedFields  -- response header v1 tagged fields
-  throttle <- int32 "throttle time"
+  _correlationId <- int32
+  skipTaggedFields  -- response header v1
+  throttle <- int32
   brokersL <- compactArray parseMetadataBrokerV12
   clId <- compactNullableString
-  ctrl <- int32 "controller id"
+  ctrl <- int32
   topicsL <- compactArray parseMetadataTopicV12
-  skipTaggedFields  -- body tagged fields
+  skipTaggedFields  -- body
   pure (MetadataResponse throttle brokersL clId ctrl topicsL)
 
-parseMetadataBrokerV12 :: Parser MetadataBroker
+parseMetadataBrokerV12 :: Wire MetadataBroker
 parseMetadataBrokerV12 = do
-  nid <- int32 "node id"
+  nid <- int32
   h <- compactString
-  p <- int32 "port"
+  p <- int32
   r <- compactNullableString
   skipTaggedFields
   pure (MetadataBroker nid h p r)
+{-# INLINE parseMetadataBrokerV12 #-}
 
-parseMetadataTopicV12 :: Parser MetadataTopic
+parseMetadataTopicV12 :: Wire MetadataTopic
 parseMetadataTopicV12 = do
-  ec <- int16 "error code"
-  tn <- TopicName <$> compactString
-  _topicId <- int64 "topic id high" >> int64 "topic id low"  -- UUID: 16 bytes
-  internal <- bool "is internal"
+  ec <- int16
+  tn <- compactString
+  skip 16  -- topicId UUID
+  internal <- parseBool
   parts <- compactArray parseMetadataPartitionV12
-  _topicAuthorizedOps <- int32 "topic authorized operations"
+  _topicAuthorizedOps <- int32
   skipTaggedFields
-  pure (MetadataTopic ec tn internal parts)
+  pure (MetadataTopic ec (TopicName tn) internal parts)
+{-# INLINE parseMetadataTopicV12 #-}
 
-parseMetadataPartitionV12 :: Parser MetadataPartition
+parseMetadataPartitionV12 :: Wire MetadataPartition
 parseMetadataPartitionV12 = do
-  ec <- int16 "error code"
-  idx <- int32 "partition index"
-  leader <- int32 "leader id"
-  epoch <- int32 "leader epoch"
-  replicas <- compactArray (int32 "replica")
-  isrs <- compactArray (int32 "isr")
-  offline <- compactArray (int32 "offline")
+  ec <- int16
+  idx <- int32
+  leader <- int32
+  epoch <- int32
+  replicas <- compactArray int32
+  isrs <- compactArray int32
+  offline <- compactArray int32
   skipTaggedFields
   pure (MetadataPartition ec idx leader epoch replicas isrs offline)
+{-# INLINE parseMetadataPartitionV12 #-}
 
-getMetadataResponse ::
-     Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String MetadataResponse))
-getMetadataResponse = fromKafkaResponse parseMetadataResponse

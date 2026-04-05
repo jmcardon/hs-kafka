@@ -16,7 +16,7 @@ import Data.List (find)
 import System.IO (Handle)
 
 import Kafka.Common
-import Kafka.Internal.Response
+import Kafka.Internal.Response (parseResponse)
 import Kafka.Internal.Request
 import Kafka.Internal.Request.Types
 
@@ -30,11 +30,11 @@ makeTopic kafka topicName handle = do
     Left err -> pure (Left err)
 
 getPartitionCount :: Kafka -> TopicName -> Int -> Maybe Handle -> IO (Either KafkaException Int32)
-getPartitionCount kafka topicName timeout handle = runExceptT $ do
-  _ <- ExceptT $ metadata kafka (MetadataRequest topicName NeverCreate) handle
+getPartitionCount kafka topicName timeout _handle = runExceptT $ do
+  _ <- ExceptT $ metadata kafka (MetadataRequest topicName NeverCreate) _handle
   interrupt <- liftIO $ registerDelay timeout
   parts <- fmap (metadataPartitions topicName) $ ExceptT $
-    tryParse <$> M.getMetadataResponse kafka interrupt handle
+    parseResponse M.parseMetadataResponse kafka interrupt
   case parts of
     Just p -> pure p
     Nothing -> throwError $

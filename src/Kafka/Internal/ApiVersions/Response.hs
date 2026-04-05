@@ -2,20 +2,17 @@ module Kafka.Internal.ApiVersions.Response
   ( ApiVersionsResponse(..)
   , ApiVersionEntry(..)
   , parseApiVersionsResponse
-  , getApiVersionsResponse
+  , parseApiVersionsResponseV3
   ) where
 
-import Control.Concurrent.STM (TVar)
 import Data.Int (Int16, Int32)
-import System.IO (Handle)
 
-import Kafka.Common
-import Kafka.Internal.Combinator
-import Kafka.Internal.Response
+import Kafka.Internal.Wire
 
 data ApiVersionsResponse = ApiVersionsResponse
-  { avErrorCode   :: {-# UNPACK #-} !Int16
-  , avApiVersions :: [ApiVersionEntry]
+  { avErrorCode    :: {-# UNPACK #-} !Int16
+  , avApiVersions  :: [ApiVersionEntry]
+  , avThrottleTime :: {-# UNPACK #-} !Int32
   } deriving (Eq, Show)
 
 data ApiVersionEntry = ApiVersionEntry
@@ -24,22 +21,34 @@ data ApiVersionEntry = ApiVersionEntry
   , aveMaxVersion :: {-# UNPACK #-} !Int16
   } deriving (Eq, Show)
 
-parseApiVersionsResponse :: Parser ApiVersionsResponse
+-- | Parse ApiVersions v0-v2 response (legacy encoding).
+-- Response header v0: just correlation_id (no tagged fields).
+parseApiVersionsResponse :: Wire ApiVersionsResponse
 parseApiVersionsResponse = do
-  _correlationId <- int32 "correlation id"
-  ApiVersionsResponse
-    <$> int16 "error code"
-    <*> array parseApiVersionEntry
+  _correlationId <- int32
+  errCode <- int16
+  arrayLen <- int32
+  entries <- count (fromIntegral arrayLen) parseApiVersionEntry
+  pure (ApiVersionsResponse errCode entries 0)
 
-parseApiVersionEntry :: Parser ApiVersionEntry
-parseApiVersionEntry = ApiVersionEntry
-  <$> int16 "api key"
-  <*> int16 "min version"
-  <*> int16 "max version"
+parseApiVersionEntry :: Wire ApiVersionEntry
+parseApiVersionEntry = ApiVersionEntry <$> int16 <*> int16 <*> int16
+{-# INLINE parseApiVersionEntry #-}
 
-getApiVersionsResponse ::
-     Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String ApiVersionsResponse))
-getApiVersionsResponse = fromKafkaResponse parseApiVersionsResponse
+-- | Parse ApiVersions v3+ response (flexible/compact encoding).
+-- Response header v0 (ApiVersions is special: no header tagged fields even in v3).
+parseApiVersionsResponseV3 :: Wire ApiVersionsResponse
+parseApiVersionsResponseV3 = do
+  _correlationId <- int32
+  errCode <- int16
+  entries <- compactArray parseApiVersionEntryV3
+  throttle <- int32
+  skipTaggedFields
+  pure (ApiVersionsResponse errCode entries throttle)
+
+parseApiVersionEntryV3 :: Wire ApiVersionEntry
+parseApiVersionEntryV3 = do
+  entry <- ApiVersionEntry <$> int16 <*> int16 <*> int16
+  skipTaggedFields
+  pure entry
+{-# INLINE parseApiVersionEntryV3 #-}

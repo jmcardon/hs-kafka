@@ -24,21 +24,21 @@ module Kafka.Client
 import Control.Concurrent.STM
 import Control.Monad (forM_, unless)
 import Data.Int (Int32)
+import Data.ByteString (ByteString)
 import Data.IntMap.Strict (IntMap)
 import Data.Map.Strict (Map)
-import Data.Primitive.ByteArray (ByteArray)
 
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
-import qualified Data.Bytes.Parser as Smith
 
 import Kafka.Common
 import Kafka.Internal.Broker
 import Kafka.Internal.Config
 import Kafka.Internal.Metadata.Request (metadataRequest)
 import Kafka.Internal.Metadata.Response (MetadataResponse(..), MetadataBroker(..), MetadataTopic(..), MetadataPartition(..), parseMetadataResponseV12)
-import qualified Data.ByteString.Char8 as BS8
 import qualified Kafka.Internal.Metadata.Response as M
+import qualified Kafka.Internal.Wire as Wire
 
 ------------------------------------------------------------------------
 -- Types
@@ -179,11 +179,10 @@ refreshTopicMetadata client topic = do
             pure (Right ())
 
 -- | Parse raw response bytes into MetadataResponse.
-parseMetadata :: ByteArray -> Either String MetadataResponse
-parseMetadata bytes =
-  case Smith.parseByteArray parseMetadataResponseV12 bytes of
-    Smith.Failure e          -> Left e
-    Smith.Success (Smith.Slice _ _ a) -> Right a
+parseMetadata :: ByteString -> Either String MetadataResponse
+parseMetadata bytes = case Wire.runWire parseMetadataResponseV12 bytes of
+  Nothing -> Left "failed to parse MetadataResponse v12"
+  Just a  -> Right a
 
 -- | Update the metadata cache and broker map from a MetadataResponse.
 -- Re-keys the broker IntMap from temporary bootstrap IDs to real node IDs

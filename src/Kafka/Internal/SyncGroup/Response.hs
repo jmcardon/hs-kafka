@@ -1,23 +1,15 @@
-{-# language
-    BangPatterns
-  #-}
-
 module Kafka.Internal.SyncGroup.Response
   ( SyncGroupResponse(..)
   , SyncMemberAssignment(..)
   , SyncTopicAssignment(..)
-  , getSyncGroupResponse
   , parseSyncGroupResponse
   ) where
 
-import Control.Concurrent.STM (TVar)
+import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32)
-import Data.Primitive.ByteArray (ByteArray)
-import System.IO (Handle)
 
-import Kafka.Internal.Combinator
-import Kafka.Common
-import Kafka.Internal.Response
+import Kafka.Common (TopicName(..))
+import Kafka.Internal.Wire
 
 data SyncGroupResponse = SyncGroupResponse
   { throttleTimeMs :: !Int32
@@ -28,7 +20,7 @@ data SyncGroupResponse = SyncGroupResponse
 data SyncMemberAssignment = SyncMemberAssignment
   { version :: !Int16
   , partitionAssignments :: [SyncTopicAssignment]
-  , userData :: !ByteArray
+  , userData :: !ByteString
   } deriving (Eq, Show)
 
 data SyncTopicAssignment = SyncTopicAssignment
@@ -36,28 +28,21 @@ data SyncTopicAssignment = SyncTopicAssignment
   , partitions :: [Int32]
   } deriving (Eq, Show)
 
-parseTopicPartitions :: Parser SyncTopicAssignment
-parseTopicPartitions = SyncTopicAssignment
-  <$> (topicName <?> "assigned topic")
-  <*> (array (int32 "assigned partitions")  <?> "assigned partitions")
-
-parseMemberAssignment :: Parser SyncMemberAssignment
-parseMemberAssignment = SyncMemberAssignment
-  <$> (int16 "assignment version")
-  <*> (array parseTopicPartitions <?> "topic partitions")
-  <*> (takeByteArray <?> "user data")
-
-parseSyncGroupResponse :: Parser SyncGroupResponse
+parseSyncGroupResponse :: Wire SyncGroupResponse
 parseSyncGroupResponse = do
-  _correlationId <- int32 "correlation id"
+  _correlationId <- int32
   SyncGroupResponse
-    <$> (int32 "throttle time")
-    <*> (int16 "error code")
-    <*> (nullableBytes parseMemberAssignment <?> "member assignment")
+    <$> int32 <*> int16
+    <*> legacyNullableBytes parseMemberAssignment
 
-getSyncGroupResponse ::
-     Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String SyncGroupResponse))
-getSyncGroupResponse = fromKafkaResponse parseSyncGroupResponse
+parseMemberAssignment :: Wire SyncMemberAssignment
+parseMemberAssignment = SyncMemberAssignment
+  <$> int16
+  <*> legacyArray parseTopicPartitions
+  <*> takeRest
+
+parseTopicPartitions :: Wire SyncTopicAssignment
+parseTopicPartitions = SyncTopicAssignment
+  <$> (TopicName <$> legacyString)
+  <*> legacyArray int32
+{-# INLINE parseTopicPartitions #-}

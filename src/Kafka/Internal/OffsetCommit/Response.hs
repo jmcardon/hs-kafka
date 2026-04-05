@@ -2,17 +2,13 @@ module Kafka.Internal.OffsetCommit.Response
   ( OffsetCommitPartition(..)
   , OffsetCommitResponse(..)
   , OffsetCommitTopic(..)
-  , getOffsetCommitResponse
   , parseOffsetCommitResponse
   ) where
 
-import Control.Concurrent.STM (TVar)
 import Data.Int (Int16, Int32)
-import System.IO (Handle)
 
-import Kafka.Internal.Combinator
-import Kafka.Common
-import Kafka.Internal.Response
+import Kafka.Common (TopicName(..))
+import Kafka.Internal.Wire
 
 data OffsetCommitResponse = OffsetCommitResponse
   { throttleTimeMs :: {-# UNPACK #-} !Int32
@@ -29,26 +25,19 @@ data OffsetCommitPartition = OffsetCommitPartition
   , errorCode :: {-# UNPACK #-} !Int16
   } deriving (Eq, Show)
 
-parseOffsetCommitResponse :: Parser OffsetCommitResponse
+parseOffsetCommitResponse :: Wire OffsetCommitResponse
 parseOffsetCommitResponse = do
-  _correlationId <- int32 "correlation id"
+  _correlationId <- int32
   OffsetCommitResponse
-    <$> (int32 "throttle time")
-    <*> (array parseOffsetCommitTopic <?> "topics")
+    <$> int32
+    <*> legacyArray parseOffsetCommitTopic
 
-parseOffsetCommitTopic :: Parser OffsetCommitTopic
+parseOffsetCommitTopic :: Wire OffsetCommitTopic
 parseOffsetCommitTopic = OffsetCommitTopic
-  <$> (topicName <?> "topic name")
-  <*> (array parseOffsetCommitPartitions <?> "partitions")
+  <$> (TopicName <$> legacyString)
+  <*> legacyArray parseOffsetCommitPartitions
+{-# INLINE parseOffsetCommitTopic #-}
 
-parseOffsetCommitPartitions :: Parser OffsetCommitPartition
-parseOffsetCommitPartitions = OffsetCommitPartition
-  <$> (int32 "partition id")
-  <*> (int16 "error code")
-
-getOffsetCommitResponse ::
-     Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String OffsetCommitResponse))
-getOffsetCommitResponse = fromKafkaResponse parseOffsetCommitResponse
+parseOffsetCommitPartitions :: Wire OffsetCommitPartition
+parseOffsetCommitPartitions = OffsetCommitPartition <$> int32 <*> int16
+{-# INLINE parseOffsetCommitPartitions #-}

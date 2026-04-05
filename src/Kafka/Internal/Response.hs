@@ -1,31 +1,23 @@
-{-# language
-    LambdaCase
-  , RankNTypes
-  #-}
+{-# language LambdaCase #-}
 
 module Kafka.Internal.Response
-  ( fromKafkaResponse
-  , getKafkaResponse
+  ( getKafkaResponse
   , getResponseSizeHeader
-  , tryParse
+  , parseResponse
   ) where
 
-import Control.Concurrent.STM (TVar)
 import Control.Exception (try, IOException)
-import Data.Int (Int32)
-import Data.Primitive.ByteArray (ByteArray)
-import qualified Data.Bytes
-import System.IO (Handle, hPutStr, hFlush)
-
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import qualified Data.Bytes.Parser as Smith
 import qualified Network.Socket.ByteString as NBS
+import Control.Concurrent.STM (TVar)
 
 import Kafka.Common
-import Kafka.Internal.Combinator
+import Kafka.Internal.Wire (Wire)
+import qualified Kafka.Internal.Wire as Wire
 
 -- | Receive exactly n bytes from a socket, or fail.
-recvExact :: Kafka -> Int -> IO (Either KafkaException BS.ByteString)
+recvExact :: Kafka -> Int -> IO (Either KafkaException ByteString)
 recvExact kafka n = do
   result <- try (go n [])
   case result of
@@ -39,22 +31,14 @@ recvExact kafka n = do
         then ioError (userError "connection closed by peer")
         else go (remaining - BS.length chunk) (chunk : acc)
 
--- | Convert a strict ByteString to a ByteArray (one copy, no intermediate list).
-bsToByteArray :: BS.ByteString -> ByteArray
-bsToByteArray bs =
-  let bytes = Data.Bytes.fromByteString bs
-  in Data.Bytes.toByteArrayClone bytes
-
--- | Read a full Kafka response (size header + body) as a ByteArray.
+-- | Read a full Kafka response (size header + body) as a ByteString.
 getKafkaResponse ::
      Kafka
-  -> TVar Bool  -- ignored (was for sockets interruption, kept for API compat)
-  -> IO (Either KafkaException ByteArray)
-getKafkaResponse kafka _interrupt = do
+  -> TVar Bool
+  -> IO (Either KafkaException ByteString)
+getKafkaResponse kafka _interrupt =
   getResponseSizeHeader kafka _interrupt >>= \case
-    Right byteCount -> do
-      result <- recvExact kafka byteCount
-      pure (bsToByteArray <$> result)
+    Right byteCount -> recvExact kafka byteCount
     Left e -> pure (Left e)
 
 getResponseSizeHeader ::
@@ -72,31 +56,12 @@ getResponseSizeHeader kafka _interrupt = do
           b3 = fromIntegral (BS.index bs 3) :: Int
       in pure (Right (b0 * 16777216 + b1 * 65536 + b2 * 256 + b3))
 
-logMaybe :: Show a => a -> Maybe Handle -> IO ()
-logMaybe a = \case
-  Nothing -> pure ()
-  Just h -> do
-    hPutStr h (show a ++ "\n\n")
-    hFlush h
-
-fromKafkaResponse :: (Show a)
-  => Parser a
-  -> Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String a))
-fromKafkaResponse parser kafka interrupt debugHandle =
+-- | Read a response from the socket and parse it with a Wire parser.
+-- Used by old Consumer-path code that reads directly from a socket.
+parseResponse :: Wire a -> Kafka -> TVar Bool -> IO (Either KafkaException a)
+parseResponse parser kafka interrupt =
   getKafkaResponse kafka interrupt >>= \case
-    Right bytes -> do
-      let res = Smith.parseByteArray parser bytes
-      logMaybe res debugHandle
-      case res of
-        Smith.Failure e -> pure (Right (Left e))
-        Smith.Success (Smith.Slice _ _ a) -> pure (Right (Right a))
     Left err -> pure (Left err)
-
-tryParse :: Either KafkaException (Either String a) -> Either KafkaException a
-tryParse = \case
-  Right (Right parsed) -> Right parsed
-  Right (Left parseError) -> Left (KafkaParseException parseError)
-  Left networkError -> Left networkError
+    Right bs -> case Wire.runWire parser bs of
+      Nothing -> pure (Left (KafkaParseException "wire parse failed"))
+      Just a  -> pure (Right a)

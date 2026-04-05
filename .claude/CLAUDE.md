@@ -9,38 +9,50 @@ algorithms directly in Haskell.
 ## Build
 
 ```bash
-cabal build                    # library
-cabal test unit                # 40 unit tests
-cabal test integration         # 10 integration tests (requires librdkafka: brew install librdkafka)
+cabal build                    # library (42 modules)
+cabal test unit                # 68 unit tests
+cabal test integration         # 16 integration tests (requires librdkafka: brew install librdkafka)
+cabal bench throughput          # criterion benchmark vs hw-kafka-client (requires librdkafka)
 ```
 
-GHC 9.12+, `default-language: GHC2024`. Flags: `-Wall -O2`.
+GHC 9.10+, `default-language: GHC2024`. Flags: `-Wall -O2`.
+
+Dependencies: `zlib`, `snappy`, `lz4`, `zstd` for compression codecs.
+`hw-kafka-client` pulled via `source-repository-package` in `cabal.project` for benchmarks.
 
 ## Reference Repositories
 
 When implementing features, refer to these codebases for algorithms:
 
 - **librdkafka** (C reference): `../librdkafka/src/`
-- **hw-kafka-client** (what we're replacing): `~/arista/hw-kafka-client/`
-- **milena** (Haskell reference, obsolete): `../milena/`
+- **hw-kafka-client** (what we're replacing): `/Users/josecardona/personal/hw-kafka-client/`
+- **Kafka protocol spec** (authoritative): `https://kafka.apache.org/42/design/protocol`
+- **Kafka protocol JSON schemas**: `https://github.com/apache/kafka/tree/trunk/clients/src/main/resources/common/message/`
 
-## Current State (March 2026)
+## Current State (April 2026)
 
 ### What Works
-- 13 Kafka API pairs (original 10 + ApiVersions v0 + InitProducerId v0 + compact encoding primitives)
+- 13 Kafka API pairs with Kafka 4.2 protocol versions (flexible encoding)
+- Protocol versions: Produce v9, Metadata v12, InitProducerId v5, ApiVersions v0/v3
 - Message format v2 (record batches, CRC32c via castagnoli)
 - Encoding via `proto3-wire` `BuildR` reverse builder, decoding via `bytesmith` (zero-copy)
 - Multi-broker client (`Client.hs`) with metadata cache and broker selection
 - Batching producer (`Producer.hs`) with linger.ms + batch.size + batch.num.messages
 - Per-broker green threads (`Broker.hs`) with sender/receiver, correlation ID tracking
+- ProduceResponse error parsing with per-partition error codes
+- Retry on retriable errors (LeaderNotAvailable, NotLeaderForPartition, etc.) with configurable retries
+- In-flight request limit (`ccMaxInFlight`, default 5) enforced via STM
+- Idempotent producer: InitProducerId on startup, per-partition sequence tracking, PID/epoch in record batches
+- Compression: gzip (zlib), snappy, lz4, zstd — with fallback when compressed >= original
 - Reconnection with exponential backoff + jitter (`Reconnect.hs`)
 - Backpressure via bounded TBQueue
-- ApiVersions handshake on every connection
+- ApiVersions v0 handshake on every connection
 - `flushProducer` to drain pending batches
-- Configurable acks and clientId (wired into produce path)
-- Compact encoding primitives ready (unsignedVarInt, compactString, compactArray, taggedFields)
-- Mock cluster FFI bindings for integration testing (links to librdkafka)
-- **40 unit tests + 10 integration tests passing**
+- Per-message delivery callbacks via TMVar (like librdkafka's dr_msg_cb)
+- Compact encoding primitives (unsignedVarInt, compactString, compactArray, taggedFields)
+- Mock cluster FFI bindings for integration testing (links to librdkafka 2.14.0)
+- Criterion benchmark comparing kafka-native vs hw-kafka-client
+- **68 unit tests + 16 integration tests passing**
 
 ### What's Fixed (was broken in original hs-kafka)
 - ~~Single broker~~ → multi-broker client with metadata
@@ -50,18 +62,34 @@ When implementing features, refer to these codebases for algorithms:
 - ~~Hardcoded acks~~ → configurable via `ccAcks`
 - ~~No reconnection~~ → exponential backoff + jitter
 - ~~No backpressure~~ → bounded TBQueue
+- ~~No error parsing~~ → ProduceResponse error codes parsed, retriable errors retried
+- ~~No in-flight limit~~ → bounded by `ccMaxInFlight` via STM
+- ~~No idempotent producer~~ → PID/epoch/sequences tracked per-partition
+- ~~No compression~~ → gzip, snappy, lz4, zstd implemented
+- ~~Protocol at Kafka 2.3~~ → upgraded to Kafka 4.2 flexible versions
 
 ### What's Still Missing
-- **ProduceResponse error parsing** — dispatcher assumes success, ignores error codes
-- **No retry** — retriable errors not retried
-- **No idempotent producer** — InitProducerId API exists but PID/epoch/sequences not tracked
-- **No in-flight limit** — unlimited pipelining
-- **No compression** — codec stubs only
+- **Produce path too slow** — 7-24x slower than hw-kafka-client; ~15k allocs per 1000-msg batch
+  from intermediate ByteArray allocations in zigzag/makeRecordMetadata/gatherChunks. Need
+  single-allocation mutable buffer approach (see `.claude/improvement.md`)
 - **Consumer not rewritten** — old single-connection code, not using KafkaClient
 - **No dynamic broker discovery** — metadata updates leaders but doesn't add new brokers
 - **No periodic metadata refresh**
 - **FindCoordinator response still ignored** in old Consumer
-- **Protocol versions at Kafka 2.3** — compact encoding ready but no APIs upgraded yet
+- **Topic UUID support** — Produce v13+, Fetch v13+, Metadata v10+ support UUIDs; we use topic names
+- **No Fetch flexible version** — Fetch still at v10 (pre-flexible), needs upgrade to v12+
+
+### Protocol Version Notes
+- **Request header v2**: clientId is ALWAYS legacy INT16 string (not COMPACT_STRING).
+  The "flexible" addition is only tagged fields after clientId. Confirmed by librdkafka
+  `rd_kafka_buf_skip_str_no_flexver()` in `rdkafka_mock.c:1136`.
+- **ApiVersions handshake**: Always sent as v0 (all brokers support it). The v0 response
+  tells us what versions the broker supports. v3 response parser is available for brokers
+  that respond with v3 format.
+- **Produce v9**: Uses compact arrays for topics/partitions, tagged fields per struct,
+  but `records` type still uses INT32 length prefix (not COMPACT_RECORDS until v13).
+- **Metadata v12**: Includes TopicId (UUID) field — we send null UUID (16 zero bytes)
+  and use topic Name for lookup.
 
 ### Migration from original hs-kafka
 - `sockets` → `network` (TCP)
@@ -87,7 +115,7 @@ src/
       Broker.hs                       -- NEW: Per-broker green thread (sender/receiver/batching/reconnect)
       Config.hs                       -- NEW: Typed config (BrokerAddress, Acknowledgments, etc.)
       Reconnect.hs                    -- NEW: Exponential backoff + jitter
-      Compression.hs                  -- NEW: Compression stubs
+      Compression.hs                  -- NEW: gzip/snappy/lz4/zstd compression
       Writer.hs                       -- Encoding primitives (proto3-wire BuildR). Legacy + compact.
       Combinator.hs                   -- Decoding primitives (bytesmith). Legacy + compact.
       Zigzag.hs                       -- Varint zigzag encoding for record batches
@@ -96,13 +124,15 @@ src/
       Request/Types.hs                -- Request data types for all API ops
       ShowDebug.hs                    -- Debug printing typeclass
       Topic.hs                        -- Topic metadata lookup
-      ApiVersions/                    -- NEW: API key 18 (connection handshake)
-      InitProducerId/                 -- NEW: API key 22 (idempotent producer, not yet wired)
+      ApiVersions/                    -- API key 18, v0 request / v0+v3 response parsers
+      InitProducerId/                 -- API key 22, v5 (flexible, wired into Producer)
       {Produce,Fetch,Metadata,...}/   -- Per-API-key Request.hs + Response.hs pairs
 test/
-  UnitTests.hs                        -- 40 unit tests
-  IntegrationTests.hs                 -- 10 integration tests against librdkafka mock cluster
+  UnitTests.hs                        -- 68 unit tests (parsers, compression, protocol, error codes)
+  IntegrationTests.hs                 -- 16 integration tests against librdkafka mock cluster
   MockCluster.hs                      -- FFI bindings to rd_kafka_mock_cluster_*
+bench/
+  Benchmark.hs                        -- Criterion: kafka-native vs hw-kafka-client throughput
 ```
 
 ### Key Types
@@ -110,8 +140,10 @@ test/
 - `TopicName` — newtype over `ByteString`
 - `GroupName` — newtype over `ByteString`
 - `KafkaClient` — multi-broker client (`TVar (IntMap BrokerEnv)` + `TVar MetadataCache`)
-- `KafkaProducer` — wraps `KafkaClient` + per-topic round-robin counters
-- `BrokerEnv` — per-broker state (TBQueue, inflight map, reconnect, ApiVersions)
+- `KafkaProducer` — wraps `KafkaClient` + per-topic round-robin counters + optional `IdempotentState`
+- `BrokerEnv` — per-broker state (TBQueue, inflight map, reconnect, ApiVersions, IdempotentRef)
+- `PendingMessage` — payload + TMVar callback + retry counter
+- `IdempotentRef` — producerId (Int64) + epoch (Int16) + per-partition sequences (MVar Map)
 - `Consumer` — `ReaderT (TVar ConsumerState) (ExceptT KafkaException IO)` (OLD, needs rewrite)
 
 ### Serialization Pattern

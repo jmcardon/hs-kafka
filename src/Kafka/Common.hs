@@ -27,6 +27,7 @@ module Kafka.Common
   , FetchErrorMessage(..)
   , OffsetCommitErrorMessage(..)
   , fromErrorCode
+  , isRetriable
   , clientId
   , clientIdLength
   , correlationId
@@ -37,7 +38,6 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int16, Int32, Int64)
 import Data.IORef (IORef)
-import Data.Primitive.ByteArray (ByteArray)
 import Data.String (IsString)
 import Network.Socket
 
@@ -97,7 +97,7 @@ data FetchErrorMessage = FetchErrorMessage
 
 data GroupMember = GroupMember
   { groupName :: !GroupName
-  , memberId :: !(Maybe ByteArray)
+  , memberId :: !(Maybe ByteString)
   }
   deriving (Eq, Show)
 
@@ -110,7 +110,7 @@ newtype GenerationId = GenerationId
   } deriving (Eq, Show)
 
 data MemberAssignment = MemberAssignment
-  { assignedMemberId :: {-# UNPACK #-} !ByteArray
+  { assignedMemberId :: !ByteString
   , assignedTopics :: [TopicAssignment]
   } deriving (Eq, Show)
 
@@ -814,3 +814,29 @@ fromErrorCode = \case
   81   -> Just GroupMaxSizeReached
   82   -> Just FencedInstanceId
   _    -> Nothing
+
+-- | Whether a Kafka protocol error is retriable.
+-- Matches librdkafka's retriable error classification.
+isRetriable :: KafkaProtocolError -> Bool
+isRetriable = \case
+  CorruptMessage             -> True
+  UnknownTopicOrPartition    -> True
+  LeaderNotAvailable         -> True
+  NotLeaderForPartition      -> True
+  RequestTimedOut            -> True
+  NetworkException           -> True
+  CoordinatorLoadInProgress  -> True
+  CoordinatorNotAvailable    -> True
+  NotCoordinator             -> True
+  NotEnoughReplicas          -> True
+  NotEnoughReplicasAfterAppend -> True
+  NotController              -> True
+  KafkaStorageError          -> True
+  FetchSessionIdNotFound     -> True
+  InvalidFetchSessionEpoch   -> True
+  ListenerNotFound           -> True
+  FencedLeaderEpoch          -> True
+  UnknownLeaderEpoch         -> True
+  OffsetNotAvailable         -> True
+  PreferredLeaderNotAvailable -> True
+  _                          -> False

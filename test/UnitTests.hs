@@ -15,14 +15,10 @@ import qualified Data.ByteString.Char8 as BC8
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Bytes
 import Data.Bytes.Types (Bytes(Bytes))
-import qualified Data.Bytes.Parser as Smith
 import qualified Data.IntMap as IM
-
-import Data.Bytes.Parser (Result(..))
 
 import Kafka.Common
 import Kafka.Consumer (merge)
-import Kafka.Internal.Combinator
 import Kafka.Internal.Compression (compressBatch, decompressBatch)
 import Kafka.Internal.Config (Compression(..))
 import Kafka.Internal.Fetch.Request
@@ -30,25 +26,24 @@ import Kafka.Internal.JoinGroup.Request
 import Kafka.Internal.ListOffsets.Request
 import Kafka.Internal.Produce.Request
 import Kafka.Internal.Produce.Response
+import Kafka.Internal.Wire (Wire, runWire)
 import Kafka.Internal.Zigzag
 import qualified Kafka.Internal.Fetch.Response as Fetch
 import Kafka.Internal.ApiVersions.Response (ApiVersionsResponse(..), ApiVersionEntry(..),
   parseApiVersionsResponse, parseApiVersionsResponseV3)
 import Kafka.Internal.InitProducerId.Response (InitProducerIdResponse(..),
   parseInitProducerIdResponse, parseInitProducerIdResponseV4)
-import Kafka.Internal.Combinator (unsignedVarInt, compactString, compactNullableString,
-  compactArray, skipTaggedFields)
 import Kafka.Internal.Writer (BuildR, toLazyByteString)
 import qualified Kafka.Internal.Writer as W
 
+import WireTests (wireTests)
+
 main :: IO ()
-main = defaultMain (testGroup "Tests" [unitTests, goldenTests])
+main = defaultMain (testGroup "Tests" [unitTests, goldenTests, wireTests])
 
 unitTests :: TestTree
 unitTests = testGroup "Unit tests"
   [ zigzagTests
-  , parserTests
-  , compactEncodingTests
   , apiVersionsTests
   , responseParserTests
   , consumerTests
@@ -82,80 +77,18 @@ zigzagTests = testGroup "zigzag"
 fromByteString :: B.ByteString -> ByteArray
 fromByteString = byteArrayFromList . B.unpack
 
--- | Build a ByteArray from a BuildR (for test response construction).
-buildBA :: BuildR -> ByteArray
-buildBA = fromByteString . BL.toStrict . toLazyByteString
+-- | Build a ByteString from a BuildR (for test response construction).
+buildBS :: BuildR -> B.ByteString
+buildBS = BL.toStrict . toLazyByteString
 
-parserTests :: TestTree
-parserTests = testGroup "Parsers"
-  [ testCase
-      "int32 [0, 0, 0, 255] is 255"
-      (Smith.parseByteArray (int32 "") (byteArrayFromList [0,0,0,255 :: Word8]) @?= Success (Smith.Slice 4 0 255))
-  , testCase
-      "int32 [0x12, 0x34, 0x56, 0x78] is 305419896"
-      (Smith.parseByteArray (int32 "") (byteArrayFromList [0x12, 0x34, 0x56, 0x78 :: Int8]) @?= Success (Smith.Slice 4 0 305419896))
-  , testCase
-      "parseVarint (zigzag 0) is 0"
-      (Smith.parseByteArray varInt (zigzag 0) @?= Success (Smith.Slice 1 0 0))
-  , testCase
-      "parseVarint (zigzag 10) is 10"
-      (Smith.parseByteArray varInt (zigzag 10) @?= Success (Smith.Slice 1 0 10))
-  , testCase
-      "parseVarint (zigzag 150) is 150"
-      (Smith.parseByteArray varInt (zigzag 150) @?= Success (Smith.Slice 2 0 150))
-  , testCase
-      "parseVarint (zigzag 1000) is 1000"
-      (Smith.parseByteArray varInt (zigzag 1000) @?= Success (Smith.Slice 2 0 1000))
-  , testCase
-      "parseVarint (zigzag (-1)) is (-1)"
-      (Smith.parseByteArray varInt (zigzag (-1)) @?= Success (Smith.Slice 1 0 (-1)))
-  ]
-
--- | Helper: encode with Writer, convert to ByteArray, parse with Combinator.
-roundTrip :: BuildR -> (forall s. Smith.Parser String s a) -> Either String a
-roundTrip builder parser =
-  case Smith.parseByteArray parser (buildBA builder) of
-    Smith.Failure e -> Left e
-    Smith.Success (Smith.Slice _ _ a) -> Right a
-
-compactEncodingTests :: TestTree
-compactEncodingTests = testGroup "Compact encoding (KIP-482)"
-  [ testCase "unsignedVarInt 0 round-trips" $
-      roundTrip (W.unsignedVarInt 0) unsignedVarInt @?= Right 0
-  , testCase "unsignedVarInt 127 round-trips" $
-      roundTrip (W.unsignedVarInt 127) unsignedVarInt @?= Right 127
-  , testCase "unsignedVarInt 128 round-trips" $
-      roundTrip (W.unsignedVarInt 128) unsignedVarInt @?= Right 128
-  , testCase "unsignedVarInt 300 round-trips" $
-      roundTrip (W.unsignedVarInt 300) unsignedVarInt @?= Right 300
-  , testCase "unsignedVarInt 16384 round-trips" $
-      roundTrip (W.unsignedVarInt 16384) unsignedVarInt @?= Right 16384
-  , testCase "compactString round-trips" $
-      roundTrip (W.compactString "hello") compactString @?= Right "hello"
-  , testCase "compactString empty round-trips" $
-      roundTrip (W.compactString "") compactString @?= Right ""
-  , testCase "compactNullableString null round-trips" $
-      roundTrip (W.compactNullableString Nothing) compactNullableString @?= Right Nothing
-  , testCase "compactNullableString present round-trips" $
-      roundTrip (W.compactNullableString (Just "test")) compactNullableString @?= Right (Just "test")
-  , testCase "compactArray of int32 round-trips" $
-      roundTrip
-        (W.compactArray [W.int32 10, W.int32 20, W.int32 30])
-        (compactArray (int32 ""))
-      @?= Right [10, 20, 30]
-  , testCase "compactArray empty round-trips" $
-      roundTrip
-        (W.compactArray [])
-        (compactArray (int32 ""))
-      @?= Right []
-  , testCase "taggedFields empty round-trips" $
-      roundTrip W.taggedFields skipTaggedFields @?= Right ()
-  ]
+-- | Parse a Wire parser on BuildR output.
+wireParse :: Wire a -> BuildR -> Maybe a
+wireParse p = runWire p . buildBS
 
 apiVersionsTests :: TestTree
 apiVersionsTests = testGroup "ApiVersions + InitProducerId"
   [ testCase "parse ApiVersionsResponse v0 (legacy) with 2 entries" $
-      let responseBytes = buildBA $
+      let responseBytes = buildBS $
             W.int32 0           -- correlationId
             <> W.int16 0        -- errorCode (no error)
             <> W.int32 2        -- array length: 2 entries
@@ -169,11 +102,11 @@ apiVersionsTests = testGroup "ApiVersions + InitProducerId"
             [ ApiVersionEntry 0 0 7
             , ApiVersionEntry 1 0 10
             ] 0
-      in case Smith.parseByteArray parseApiVersionsResponse responseBytes of
-        Smith.Success (Smith.Slice _ _ resp) -> resp @?= expected
-        Smith.Failure e -> assertFailure ("parse failed: " ++ e)
+      in case runWire parseApiVersionsResponse responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse failed"
   , testCase "parse ApiVersionsResponse v3 (flexible) with tagged fields" $
-      let responseBytes = buildBA $
+      let responseBytes = buildBS $
             W.int32 42          -- correlationId
             <> W.int16 0        -- errorCode
             -- compact array: 2 entries → varint(3)
@@ -194,32 +127,32 @@ apiVersionsTests = testGroup "ApiVersions + InitProducerId"
             [ ApiVersionEntry 0 0 9
             , ApiVersionEntry 18 0 3
             ] 100
-      in case Smith.parseByteArray parseApiVersionsResponseV3 responseBytes of
-        Smith.Success (Smith.Slice _ _ resp) -> resp @?= expected
-        Smith.Failure e -> assertFailure ("parse v3 failed: " ++ e)
+      in case runWire parseApiVersionsResponseV3 responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse v3 failed"
   , testCase "parse ApiVersionsResponse v3 with error code" $
-      let responseBytes = buildBA $
+      let responseBytes = buildBS $
             W.int32 0           -- correlationId
             <> W.int16 35       -- errorCode (UnsupportedVersion)
             <> W.unsignedVarInt 1  -- empty compact array
             <> W.int32 0        -- throttle time
             <> W.unsignedVarInt 0  -- body tagged fields
-      in case Smith.parseByteArray parseApiVersionsResponseV3 responseBytes of
-        Smith.Success (Smith.Slice _ _ resp) -> avErrorCode resp @?= 35
-        Smith.Failure e -> assertFailure ("parse failed: " ++ e)
+      in case runWire parseApiVersionsResponseV3 responseBytes of
+        Just resp -> avErrorCode resp @?= 35
+        Nothing -> assertFailure "parse failed"
   , testCase "parse InitProducerIdResponse v0 (legacy)" $
-      let responseBytes = buildBA $
+      let responseBytes = buildBS $
             W.int32 0           -- correlationId
             <> W.int32 0        -- throttleTimeMs
             <> W.int16 0        -- errorCode
             <> W.int64 12345    -- producerId
             <> W.int16 0        -- producerEpoch
           expected = InitProducerIdResponse 0 0 12345 0
-      in case Smith.parseByteArray parseInitProducerIdResponse responseBytes of
-        Smith.Success (Smith.Slice _ _ resp) -> resp @?= expected
-        Smith.Failure e -> assertFailure ("parse failed: " ++ e)
+      in case runWire parseInitProducerIdResponse responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse failed"
   , testCase "parse InitProducerIdResponse v4 (flexible)" $
-      let responseBytes = buildBA $
+      let responseBytes = buildBS $
             W.int32 99          -- correlationId
             <> W.unsignedVarInt 0  -- header v1 tagged fields
             <> W.int32 50       -- throttleTimeMs
@@ -228,11 +161,11 @@ apiVersionsTests = testGroup "ApiVersions + InitProducerId"
             <> W.int16 5        -- producerEpoch
             <> W.unsignedVarInt 0  -- body tagged fields
           expected = InitProducerIdResponse 50 0 999 5
-      in case Smith.parseByteArray parseInitProducerIdResponseV4 responseBytes of
-        Smith.Success (Smith.Slice _ _ resp) -> resp @?= expected
-        Smith.Failure e -> assertFailure ("parse v4 failed: " ++ e)
+      in case runWire parseInitProducerIdResponseV4 responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse v4 failed"
   , testCase "parse InitProducerIdResponse v4 with error" $
-      let responseBytes = buildBA $
+      let responseBytes = buildBS $
             W.int32 0
             <> W.unsignedVarInt 0  -- header v1 tagged fields
             <> W.int32 0        -- throttleTimeMs
@@ -240,9 +173,9 @@ apiVersionsTests = testGroup "ApiVersions + InitProducerId"
             <> W.int64 (-1)     -- producerId
             <> W.int16 (-1)     -- producerEpoch
             <> W.unsignedVarInt 0
-      in case Smith.parseByteArray parseInitProducerIdResponseV4 responseBytes of
-        Smith.Success (Smith.Slice _ _ resp) -> ipErrorCode resp @?= 45
-        Smith.Failure e -> assertFailure ("parse failed: " ++ e)
+      in case runWire parseInitProducerIdResponseV4 responseBytes of
+        Just resp -> ipErrorCode resp @?= 45
+        Nothing -> assertFailure "parse failed"
   ]
 
 responseParserTests :: TestTree
@@ -429,7 +362,7 @@ goldenTests = testGroup "Golden tests"
           (joinGroupTest
             (GroupMember
               ("test-group")
-              (Just $ fromByteString "test-member-id")))
+              (Just "test-member-id")))
       ]
   ]
 
@@ -468,19 +401,14 @@ produceResponseTest :: TestTree
 produceResponseTest = testGroup "Produce"
   [ testCase
       "One message"
-      (parseProduce oneMsgProduceResponseBytes @?=
-        Success (Smith.Slice 58 0 oneMsgProduceResponse))
+      (runWire parseProduceResponse oneMsgProduceResponseBytes @?= Just oneMsgProduceResponse)
   , testCase
       "Two messages"
-      (parseProduce twoMsgProduceResponseBytes @?=
-        Success (Smith.Slice 88 0 twoMsgProduceResponse))
+      (runWire parseProduceResponse twoMsgProduceResponseBytes @?= Just twoMsgProduceResponse)
   ]
 
-parseProduce :: ByteArray -> Result String ProduceResponse
-parseProduce = Smith.parseByteArray parseProduceResponse
-
-oneMsgProduceResponseBytes :: ByteArray
-oneMsgProduceResponseBytes = buildBA $
+oneMsgProduceResponseBytes :: B.ByteString
+oneMsgProduceResponseBytes = buildBS $
   W.int32 0
   <> W.int32 1
   <> W.string "topic-name"
@@ -492,8 +420,8 @@ oneMsgProduceResponseBytes = buildBA $
   <> W.int64 14
   <> W.int32 1
 
-twoMsgProduceResponseBytes :: ByteArray
-twoMsgProduceResponseBytes = buildBA $
+twoMsgProduceResponseBytes :: B.ByteString
+twoMsgProduceResponseBytes = buildBS $
   W.int32 0
   <> W.int32 1
   <> W.string "topic-name"
@@ -561,7 +489,7 @@ twoMsgProduceResponse =
 produceResponseV9Test :: TestTree
 produceResponseV9Test = testGroup "Produce v9 (flexible)"
   [ testCase "parse v9 response with success" $
-      let responseBytes = buildBA $
+      let responseBytes = buildBS $
             W.int32 0           -- correlationId
             <> W.unsignedVarInt 0  -- header v1 tagged fields
             -- compact array of topic responses: 1 topic → varint(2)
@@ -593,11 +521,11 @@ produceResponseV9Test = testGroup "Produce v9 (flexible)"
                 ]
             , throttleTimeMs = 0
             }
-      in case Smith.parseByteArray parseProduceResponseV9 responseBytes of
-        Smith.Success (Smith.Slice _ _ resp) -> resp @?= expected
-        Smith.Failure e -> assertFailure ("parse v9 failed: " ++ e)
+      in case runWire parseProduceResponseV9 responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse v9 failed"
   , testCase "parse v9 response with error code" $
-      let responseBytes = buildBA $
+      let responseBytes = buildBS $
             W.int32 0
             <> W.unsignedVarInt 0  -- header v1 tagged fields
             <> W.unsignedVarInt 2  -- 1 topic
@@ -610,13 +538,13 @@ produceResponseV9Test = testGroup "Produce v9 (flexible)"
             <> W.unsignedVarInt 0  -- topic tf
             <> W.int32 0           -- throttle
             <> W.unsignedVarInt 0  -- body tf
-      in case Smith.parseByteArray parseProduceResponseV9 responseBytes of
-        Smith.Success (Smith.Slice _ _ resp) -> do
+      in case runWire parseProduceResponseV9 responseBytes of
+        Just resp -> do
           let partResp = head (prPartitionResponses (head (produceResponseMessages resp)))
           prResponseErrorCode partResp @?= 6
-        Smith.Failure e -> assertFailure ("parse v9 failed: " ++ e)
+        Nothing -> assertFailure "parse v9 failed"
   , testCase "parse v9 response with multiple partitions" $
-      let responseBytes = buildBA $
+      let responseBytes = buildBS $
             W.int32 0
             <> W.unsignedVarInt 0  -- header v1 tagged fields
             <> W.unsignedVarInt 2  -- 1 topic
@@ -634,14 +562,14 @@ produceResponseV9Test = testGroup "Produce v9 (flexible)"
             <> W.unsignedVarInt 0  -- topic tf
             <> W.int32 0
             <> W.unsignedVarInt 0  -- body tf
-      in case Smith.parseByteArray parseProduceResponseV9 responseBytes of
-        Smith.Success (Smith.Slice _ _ resp) -> do
+      in case runWire parseProduceResponseV9 responseBytes of
+        Just resp -> do
           let parts = prPartitionResponses (head (produceResponseMessages resp))
           length parts @?= 3
           prResponseErrorCode (parts !! 0) @?= 0
           prResponseErrorCode (parts !! 1) @?= 5
           prResponseErrorCode (parts !! 2) @?= 0
-        Smith.Failure e -> assertFailure ("parse v9 failed: " ++ e)
+        Nothing -> assertFailure "parse v9 failed"
   ]
 
 fetchResponseTest :: TestTree
@@ -651,10 +579,9 @@ fetchResponseTest = testGroup "Fetch"
       "test/golden/fetch-response-parsed"
       (do
         rawBytes <- B.readFile "test/golden/fetch-response-bytes"
-        let ba = fromByteString rawBytes
-        case Smith.parseByteArray Fetch.parseFetchResponse ba of
-          Failure e -> fail ("Parse failed with " <> e)
-          Success (Smith.Slice _ _ res) -> pure (BL.fromStrict (BC8.pack (show res)))
+        case runWire Fetch.parseFetchResponse rawBytes of
+          Nothing -> fail "Parse failed"
+          Just res -> pure (BL.fromStrict (BC8.pack (show res)))
       )
   ]
 

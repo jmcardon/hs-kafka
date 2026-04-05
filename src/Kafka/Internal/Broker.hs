@@ -47,9 +47,9 @@ import Data.IntMap.Strict (IntMap)
 import Data.IORef
 import Data.Int (Int16, Int32, Int64)
 import Data.Map.Strict (Map)
-import Data.Primitive.ByteArray (ByteArray, sizeofByteArray, indexByteArray)
+import Data.ByteString (ByteString)
+import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
 import Data.Primitive.Unlifted.Array
-import Data.Word (Word32, byteSwap32)
 import Numeric.Natural (Natural)
 
 import qualified Data.ByteString as BS
@@ -68,8 +68,7 @@ import Kafka.Internal.Produce.Response (ProduceResponse(..), ProduceResponseMess
   ProducePartitionResponse(..), parseProduceResponseV9)
 import Kafka.Internal.Reconnect
 import Kafka.Internal.Response (getKafkaResponse)
-
-import qualified Data.Bytes.Parser as Smith
+import qualified Kafka.Internal.Wire as Wire
 
 ------------------------------------------------------------------------
 -- Types
@@ -93,14 +92,14 @@ data BrokerOp
       !PendingMessage
   | BrokerSendRaw
       !BSL.ByteString                                -- pre-encoded request
-      !(TMVar (Either KafkaException ByteArray))     -- raw response slot
+      !(TMVar (Either KafkaException ByteString))    -- raw response slot
   | BrokerFlush
       !(TMVar ())                                  -- signal when flush is done
   | BrokerShutdown
 
 -- | Inflight request entry — how to dispatch the response.
 data InflightEntry
-  = InflightRaw    !(TMVar (Either KafkaException ByteArray))
+  = InflightRaw    !(TMVar (Either KafkaException ByteString))
   | InflightBatch  !TopicName ![(Int32, [PendingMessage])]
     -- ^ topic, [(partition, [messages with retry info])]
 
@@ -230,7 +229,7 @@ enqueueProduce env topic part payload = do
 -- | Enqueue a pre-encoded request (metadata, fetch, etc.).
 -- Returns a TMVar that will be filled with the raw response bytes.
 enqueueRequest :: BrokerEnv -> BSL.ByteString
-              -> IO (TMVar (Either KafkaException ByteArray))
+              -> IO (TMVar (Either KafkaException ByteString))
 enqueueRequest env reqBytes = do
   result <- newEmptyTMVarIO
   atomically $ writeTBQueue (beOps env) (BrokerSendRaw reqBytes result)
@@ -292,9 +291,9 @@ performHandshake env kafka = do
       case resp of
         Left _ -> pure ()
         Right responseBytes ->
-          case Smith.parseByteArray parseApiVersionsResponse responseBytes of
-            Smith.Failure _ -> pure ()
-            Smith.Success (Smith.Slice _ _ avResp) ->
+          case Wire.runWire parseApiVersionsResponse responseBytes of
+            Nothing -> pure ()
+            Just avResp ->
               atomically $ writeTVar (beApiVersions env)
                 (Just (avApiVersions avResp))
 
@@ -453,7 +452,7 @@ messagesToPayloadArray msgs = runUnliftedArray $ do
 ------------------------------------------------------------------------
 
 sendRawRequest :: BrokerEnv -> Kafka -> BSL.ByteString
-              -> TMVar (Either KafkaException ByteArray) -> IO ()
+              -> TMVar (Either KafkaException ByteString) -> IO ()
 sendRawRequest env kafka reqBytes respVar = do
   corrId <- nextCorrId (beCorrCounter env)
   let patched = patchCorrelationIdLBS corrId reqBytes
@@ -490,7 +489,7 @@ receiverLoop env kafka = do
 -- | Extract correlation ID from response and dispatch to the waiting caller.
 -- For produce responses, parses error codes per partition and retries
 -- on retriable errors if retries remain.
-dispatchResponse :: BrokerEnv -> ByteArray -> IO ()
+dispatchResponse :: BrokerEnv -> ByteString -> IO ()
 dispatchResponse env responseBytes = do
   let corrId = extractCorrelationId responseBytes
   mEntry <- atomically $ do
@@ -508,13 +507,12 @@ dispatchResponse env responseBytes = do
       -- Decrement in-flight count
       atomically $ modifyTVar' (beInflightCount env) (subtract 1)
       -- Parse the ProduceResponse to get per-partition error codes
-      case Smith.parseByteArray parseProduceResponseV9 responseBytes of
-        Smith.Failure _parseErr ->
-          -- Parse failed — report error to all callbacks
+      case Wire.runWire parseProduceResponseV9 responseBytes of
+        Nothing ->
           let err = Left (KafkaParseException "failed to parse ProduceResponse")
           in atomically $ forM_ callbacks $ \(_part, msgs) ->
                forM_ msgs $ \m -> void $ tryPutTMVar (pmResult m) err
-        Smith.Success (Smith.Slice _ _ prodResp) ->
+        Just prodResp ->
           dispatchProduceResponse env topic callbacks prodResp
 
 -- | Dispatch a parsed ProduceResponse to the waiting callbacks.
@@ -585,9 +583,15 @@ nextCorrId ref = atomicModifyIORef' ref $ \n -> (n + 1, n)
 -- | Extract correlation ID from the first 4 bytes of a response body.
 -- Kafka response format: [4-byte size (already consumed)] [4-byte corrId] [...]
 -- getKafkaResponse returns the body (starting with corrId).
-extractCorrelationId :: ByteArray -> Int
-extractCorrelationId ba =
-  fromIntegral (byteSwap32 (indexByteArray ba 0 :: Word32))
+extractCorrelationId :: ByteString -> Int
+extractCorrelationId bs
+  | BS.length bs >= 4 =
+      let b0 = fromIntegral (BS.index bs 0) :: Int
+          b1 = fromIntegral (BS.index bs 1) :: Int
+          b2 = fromIntegral (BS.index bs 2) :: Int
+          b3 = fromIntegral (BS.index bs 3) :: Int
+      in b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+  | otherwise = -1
 
 ------------------------------------------------------------------------
 -- Correlation ID patching

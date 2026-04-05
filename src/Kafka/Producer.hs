@@ -38,7 +38,6 @@ import Data.Primitive.ByteArray (ByteArray)
 
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
-import qualified Data.Bytes.Parser as Smith
 
 import Kafka.Common
 import Kafka.Client
@@ -48,6 +47,7 @@ import Kafka.Internal.Config
 import Kafka.Internal.InitProducerId.Request (initProducerIdRequest)
 import Kafka.Internal.InitProducerId.Response (InitProducerIdResponse(..),
   parseInitProducerIdResponseV4)
+import qualified Kafka.Internal.Wire as Wire
 
 ------------------------------------------------------------------------
 -- Types
@@ -119,10 +119,9 @@ initIdempotentState client = do
       response <- atomically $ readTMVar respVar
       case response of
         Left err -> pure (Left err)
-        Right bytes ->
-          case Smith.parseByteArray parseInitProducerIdResponseV4 bytes of
-            Smith.Failure e -> pure (Left (KafkaParseException e))
-            Smith.Success (Smith.Slice _ _ resp)
+        Right bytes -> case Wire.runWire parseInitProducerIdResponseV4 bytes of
+            Nothing -> pure (Left (KafkaParseException "failed to parse InitProducerIdResponse"))
+            Just resp
               | ipErrorCode resp /= 0 ->
                   pure (Left (KafkaUnexpectedErrorCodeException (ipErrorCode resp)))
               | otherwise -> do

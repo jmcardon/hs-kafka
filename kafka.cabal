@@ -50,6 +50,7 @@ library
     Kafka.Internal.SyncGroup.Request
     Kafka.Internal.SyncGroup.Response
     Kafka.Internal.Topic
+    Kafka.Internal.Wire
     Kafka.Internal.Writer
     Kafka.Internal.Zigzag
   -- Prelude: using base's standard Prelude
@@ -84,6 +85,7 @@ library
 test-suite unit
   type:             exitcode-stdio-1.0
   main-is:          UnitTests.hs
+  other-modules:    WireTests
   hs-source-dirs:   test
   build-depends:
     , base
@@ -124,6 +126,22 @@ test-suite integration
     include-dirs:     /usr/include /usr/include/librdkafka
   default-language: GHC2024
   ghc-options:      -Wall -O2 -threaded
+
+benchmark wire-parse
+  type:             exitcode-stdio-1.0
+  main-is:          WireBench.hs
+  hs-source-dirs:   bench
+  build-depends:
+    , base
+    , bytesmith
+    , byteslice
+    , bytestring
+    , criterion
+    , deepseq
+    , kafka
+    , primitive
+  default-language: GHC2024
+  ghc-options:      -Wall -O2
 
 benchmark throughput
   type:             exitcode-stdio-1.0

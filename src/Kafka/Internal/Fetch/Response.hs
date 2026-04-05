@@ -1,9 +1,10 @@
 {-# language
     BangPatterns
-  , LambdaCase
+  , MagicHash
   , OverloadedStrings
-  , RankNTypes
   , RecordWildCards
+  , UnboxedSums
+  , UnboxedTuples
   #-}
 
 module Kafka.Internal.Fetch.Response
@@ -14,34 +15,32 @@ module Kafka.Internal.Fetch.Response
   , FetchPartition(..)
   , Record(..)
   , RecordBatch(..)
-  , getFetchResponse
   , parseFetchResponse
   , partitionLastSeenOffset
   ) where
 
-import Control.Concurrent.STM (TVar)
-import Control.Monad ((<=<))
+import Data.ByteString (ByteString)
 import Data.Int (Int8, Int16, Int32, Int64)
 import Data.List (find, intercalate)
 import Data.List.NonEmpty (nonEmpty)
 import Data.Maybe (mapMaybe)
-import Data.Primitive.ByteArray (ByteArray)
-import System.IO (Handle)
 
 import qualified Data.Foldable as F
 
-import Kafka.Common
-import Kafka.Internal.Combinator
-import Kafka.Internal.Response
+import GHC.Exts (Addr#, eqAddr#)
+import GHC.ForeignPtr (ForeignPtrContents)
 
-fetchResponseContents :: FetchResponse -> [ByteArray]
+import Kafka.Common (TopicName(..))
+import Kafka.Internal.Wire
+
+fetchResponseContents :: FetchResponse -> [ByteString]
 fetchResponseContents = id
-  . mapMaybe recordValue -- [Records] -> [ByteArray]
-  . concatMap records -- [RecordBatch] -> [Records]
-  . concat -- [[RecordBatch]] -> [RecordBatch]
-  . mapMaybe recordSet -- [FetchPartition] -> [[RecordBatch]]
-  . concatMap partitions -- [FetchTopic] -> [FetchPartition]
-  . topics -- FetchResponse -> [FetchTopic]
+  . mapMaybe recordValue
+  . concatMap records
+  . concat
+  . mapMaybe recordSet
+  . concatMap partitions
+  . topics
 
 instance Show FetchResponse where
   show resp =
@@ -49,13 +48,12 @@ instance Show FetchResponse where
     <> show (errorCode resp)
     <> ", partition_header errors "
     <> intercalate ","
-       ( (
-         ( ( \x -> if x == 0 then [] else [show x]) . partitionHeaderErrorCode . partitionHeader)
-         <=< partitions
-         <=< topics
-         )
-         resp
-       )
+       [ show x
+       | t <- topics resp
+       , p <- partitions t
+       , let x = partitionHeaderErrorCode (partitionHeader p)
+       , x /= 0
+       ]
     <> ", "
     <> show (length (fetchResponseContents resp))
     <> " records)"
@@ -112,112 +110,110 @@ data Record = Record
   , recordAttributes :: {-# UNPACK #-} !Int8
   , recordTimestampDelta :: {-# UNPACK #-} !Int
   , recordOffsetDelta :: {-# UNPACK #-} !Int
-  , recordKey :: !(Maybe ByteArray)
-  , recordValue :: !(Maybe ByteArray)
+  , recordKey :: !(Maybe ByteString)
+  , recordValue :: !(Maybe ByteString)
   , recordHeaders :: [Header]
   } deriving (Eq, Show)
 
 data Header = Header
-  { headerKey :: !(Maybe ByteArray)
-  , headerValue :: !(Maybe ByteArray)
+  { headerKey :: !(Maybe ByteString)
+  , headerValue :: !(Maybe ByteString)
   } deriving (Eq, Show)
 
-parseFetchResponse :: Parser FetchResponse
+parseFetchResponse :: Wire FetchResponse
 parseFetchResponse = do
-  _correlationId <- int32 "correlation id"
+  _correlationId <- int32
   FetchResponse
-    <$> int32 "throttleTimeMs"
-    <*> int16 "errorCode"
-    <*> int32 "sessionId"
-    <*> nullableArray parseFetchTopic
+    <$> int32 <*> int16 <*> int32
+    <*> legacyNullableArray parseFetchTopic
 
-parseFetchTopic :: Parser FetchTopic
-parseFetchTopic = do
-  t <- topicName <?> "topic name"
-  rs <- nullableArray parseFetchPartition
-  pure (FetchTopic t rs)
+parseFetchTopic :: Wire FetchTopic
+parseFetchTopic = FetchTopic
+  <$> (TopicName <$> legacyString)
+  <*> legacyNullableArray parseFetchPartition
+{-# INLINE parseFetchTopic #-}
 
-parseFetchPartition :: Parser FetchPartition
+parseFetchPartition :: Wire FetchPartition
 parseFetchPartition = FetchPartition
-  <$> (parsePartitionHeader <?> "partition header")
-  <*> (nullableSequence parseRecordBatch <?> "record batch")
+  <$> parsePartitionHeader
+  <*> parseNullableRecordBatches
+{-# INLINE parseFetchPartition #-}
 
-parsePartitionHeader :: Parser PartitionHeader
+parsePartitionHeader :: Wire PartitionHeader
 parsePartitionHeader = PartitionHeader
-  <$> (int32 "partition")
-  <*> (int16 "error code")
-  <*> (int64 "high watermark")
-  <*> (int64 "last stable offset")
-  <*> (int64 "log start offset")
-  <*> (nullableArray parseAbortedTransaction <?> "aborted transactions")
+  <$> int32 <*> int16 <*> int64 <*> int64 <*> int64
+  <*> legacyNullableArray parseAbortedTransaction
+{-# INLINE parsePartitionHeader #-}
 
-parseAbortedTransaction :: Parser AbortedTransaction
-parseAbortedTransaction = AbortedTransaction
-  <$> (int64 "producer id")
-  <*> (int64 "first offset")
+parseAbortedTransaction :: Wire AbortedTransaction
+parseAbortedTransaction = AbortedTransaction <$> int64 <*> int64
+{-# INLINE parseAbortedTransaction #-}
 
-parseRecordBatch :: Parser RecordBatch
+-- | Nullable record set: INT32 length, then record batches until length consumed.
+-- Uses a sub-parse on the bytes slice.
+parseNullableRecordBatches :: Wire (Maybe [RecordBatch])
+parseNullableRecordBatches = do
+  len <- int32
+  if len <= 0
+    then pure Nothing
+    else do
+      batchBytes <- takeBytes (fromIntegral len)
+      case runWire (parseMany parseRecordBatch) batchBytes of
+        Nothing -> pure Nothing
+        Just rbs -> pure (Just rbs)
+
+-- | Parse as many items as possible until input exhausted.
+parseMany :: Wire a -> Wire [a]
+parseMany (Wire p) = Wire $ \fpc pos end -> go fpc pos end []
+  where
+    go fpc pos end !acc = case eqAddr# pos end of
+      1# -> OK# (reverse acc) pos
+      _  -> case p fpc pos end of
+        OK# a pos' -> go fpc pos' end (a : acc)
+        _          -> OK# (reverse acc) pos  -- stop on failure (partial batch)
+
+parseRecordBatch :: Wire RecordBatch
 parseRecordBatch = RecordBatch
-  <$> int64 "baseOffset"
-  <*> int32 "batchLength"
-  <*> int32 "partitionLeaderEpoch"
-  <*> int8 "recordBatchMagic"
-  <*> int32 "crc"
-  <*> int16 "attributes"
-  <*> int32 "lastOffsetDelta"
-  <*> int64 "firstTiemstamp"
-  <*> int64 "maxTimestamp"
-  <*> int64 "producerId"
-  <*> int16 "producerEpoch"
-  <*> int32 "baseSequence"
-  <*> nullableArray parseRecord
+  <$> int64 <*> int32 <*> int32 <*> int8 <*> int32
+  <*> int16 <*> int32 <*> int64 <*> int64 <*> int64 <*> int16 <*> int32
+  <*> legacyNullableArray parseRecord
 
-parseRecord :: Parser Record
+parseRecord :: Wire Record
 parseRecord = do
-  recordLength <- varInt <?> "record length"
-  recordAttributes <- int8 "record attributes"
-  recordTimestampDelta <- varInt <?> "record timestamp delta"
-  recordOffsetDelta <- varInt <?> "record offset delta"
-  recordKey <- nullableByteArrayVar <?> "record key"
-  recordValue <- nullableByteArrayVar <?> "record value"
-  recordHeaders <- varintArray parseHeader <?> "record headers"
+  recordLength <- signedVarInt
+  recordAttributes <- int8
+  recordTimestampDelta <- signedVarInt
+  recordOffsetDelta <- signedVarInt
+  recordKey <- varintNullableBytes
+  recordValue <- varintNullableBytes
+  recordHeaders <- varintArray parseHeader
   pure (Record {..})
 
-varintArray :: Parser a -> Parser [a]
+varintNullableBytes :: Wire (Maybe ByteString)
+varintNullableBytes = do
+  len <- signedVarInt
+  if len < 0 then pure Nothing else Just <$> takeBytes len
+{-# INLINE varintNullableBytes #-}
+
+varintArray :: Wire a -> Wire [a]
 varintArray p = do
-  arraySize <- varInt
-  count arraySize p
+  n <- signedVarInt
+  count n p
+{-# INLINE varintArray #-}
 
-parseHeader :: Parser Header
-parseHeader = do
-  headerKey <- nullableByteArrayVar <?> "header key"
-  headerValue <- nullableByteArrayVar <?> "header value"
-  pure (Header {..})
+parseHeader :: Wire Header
+parseHeader = Header <$> varintNullableBytes <*> varintNullableBytes
+{-# INLINE parseHeader #-}
 
-getFetchResponse ::
-     Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String FetchResponse))
-getFetchResponse = fromKafkaResponse parseFetchResponse
-
-lookupTopic :: [FetchTopic] -> TopicName -> Maybe FetchTopic
-lookupTopic responses t = find
-  (\resp -> t == topic resp)
-  responses
-
-lookupPartition :: [FetchPartition] -> Int32 -> Maybe FetchPartition
-lookupPartition responses pid = find
-  (\resp -> pid == partition (partitionHeader resp))
-  responses
+-- Lookups
 
 partitionLastSeenOffset :: FetchResponse -> TopicName -> Int32 -> Maybe Int64
 partitionLastSeenOffset fetchResponse t partitionId = do
-  topic <- lookupTopic (topics fetchResponse) t
-  partition <- lookupPartition (partitions topic) partitionId
-  set <- recordSet partition
+  ftopic <- find (\resp -> t == topic resp) (topics fetchResponse)
+  fpart <- find (\resp -> partitionId == partition (partitionHeader resp)) (partitions ftopic)
+  set <- recordSet fpart
   maxMaybe (fmap recordBatchLastOffset set)
   where
-  recordBatchLastOffset rb =
-    baseOffset rb + fromIntegral (lastOffsetDelta rb) + 1
-  maxMaybe xs = fmap (F.foldr1 max) (nonEmpty xs)
+    recordBatchLastOffset rb =
+      baseOffset rb + fromIntegral (lastOffsetDelta rb) + 1
+    maxMaybe xs = fmap (F.foldr1 max) (nonEmpty xs)

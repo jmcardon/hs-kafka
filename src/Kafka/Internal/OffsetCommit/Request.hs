@@ -4,12 +4,8 @@ module Kafka.Internal.OffsetCommit.Request
   ( offsetCommitRequest
   ) where
 
-import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as BSL
-import Data.Bytes.Types (Bytes(Bytes))
-import qualified Data.Bytes
 import Data.Int (Int16, Int32, Int64)
-import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
 
 import Kafka.Common
 import Kafka.Internal.Writer
@@ -26,9 +22,6 @@ offsetCommitApiKey = 8
 
 offsetCommitApiVersion :: Int16
 offsetCommitApiVersion = 6
-
-baToBS :: ByteArray -> ByteString
-baToBS ba = Data.Bytes.toByteString (Bytes ba 0 (sizeofByteArray ba))
 
 offsetCommitRequest ::
      TopicName
@@ -50,7 +43,7 @@ offsetCommitRequest topic offs groupMember generationId =
       <> int32 genId
       <> maybe
           (int16 0)
-          (\m -> bytearray (baToBS m))
+          (\m -> bytearray m)
           mid
       <> int32 1 -- 1 topic
       <> topicName topic

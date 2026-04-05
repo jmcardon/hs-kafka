@@ -7,11 +7,8 @@ module Kafka.Internal.JoinGroup.Request
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
-import Data.Bytes.Types (Bytes(Bytes))
-import qualified Data.Bytes
 import Data.Coerce (coerce)
 import Data.Int (Int16, Int32)
-import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
 
 import Kafka.Common
 import Kafka.Internal.Writer
@@ -40,9 +37,6 @@ defaultProtocolData topic =
   where
     topicSize = BS.length (coerce topic :: ByteString)
 
-baToBS :: ByteArray -> ByteString
-baToBS ba = Data.Bytes.toByteString (Bytes ba 0 (sizeofByteArray ba))
-
 joinGroupRequest ::
      TopicName
   -> GroupMember
@@ -58,7 +52,7 @@ joinGroupRequest topic (GroupMember (GroupName gid) mid) =
     <> int32 defaultRebalanceTimeout
     <> maybe
         (int16 0)
-        (\m -> bytearray (baToBS m))
+        (\m -> bytearray m)
         mid
     <> string "consumer"
     <> defaultProtocolData topic

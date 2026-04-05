@@ -1,44 +1,29 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 module Kafka.Internal.FindCoordinator.Response
   ( FindCoordinatorResponse(..)
-  , getFindCoordinatorResponse
   , parseFindCoordinatorResponse
   ) where
 
-import Control.Concurrent.STM (TVar)
+import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32)
-import Data.Primitive.ByteArray (ByteArray)
-import System.IO (Handle)
 
-import Kafka.Common
-import Kafka.Internal.Combinator
-import Kafka.Internal.Response
+import Kafka.Internal.Wire
 
 data FindCoordinatorResponse = FindCoordinatorResponse
   { throttleTimeMs :: {-# UNPACK #-} !Int32
   , errorCode :: {-# UNPACK #-} !Int16
-  , errorMessage :: !(Maybe ByteArray)
+  , errorMessage :: !(Maybe ByteString)
   , node_id :: {-# UNPACK #-} !Int32
-  , host :: {-# UNPACK #-} !ByteArray
+  , host :: !ByteString
   , port :: {-# UNPACK #-} !Int32
   } deriving (Eq, Show)
 
-parseFindCoordinatorResponse :: Parser FindCoordinatorResponse
+parseFindCoordinatorResponse :: Wire FindCoordinatorResponse
 parseFindCoordinatorResponse = do
-  _correlationId <- int32 "correlation id"
+  _correlationId <- int32
   FindCoordinatorResponse
-    <$> (int32 "throttle time")
-    <*> (int16 "error code")
-    <*> (nullableByteArray <?> "generation id")
-    <*> (int32 "group protocol")
-    <*> (bytearray <?> "leader id")
-    <*> (int32 "member id")
-
-getFindCoordinatorResponse ::
-     Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String FindCoordinatorResponse))
-getFindCoordinatorResponse = fromKafkaResponse parseFindCoordinatorResponse
-
+    <$> int32
+    <*> int16
+    <*> legacyNullableString
+    <*> int32
+    <*> legacyString
+    <*> int32
