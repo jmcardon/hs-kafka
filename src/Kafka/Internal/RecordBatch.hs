@@ -40,11 +40,11 @@ buildRecordBatch ::
   -> [ByteString]  -- ^ message payloads
   -> ByteString
 buildRecordBatch !pid !epoch !baseSeq !comprAttr payloads =
-  let !recordsSize = computeRecordsSize payloads
+  let !(# recordsSize, payloadCount #) = computeRecordsSizeAndCount payloads
       !totalSize = 61 + recordsSize
   in unsafeCreate totalSize $ \ptr -> do
     writeAllRecords (ptr `plusPtr` 61) payloads 0
-    writePostCrc ptr pid epoch baseSeq comprAttr (length payloads)
+    writePostCrc ptr pid epoch baseSeq comprAttr payloadCount
     let !crc = crc32cPtr (ptr `plusPtr` 21) (40 + recordsSize)
     writePreCrc ptr recordsSize crc
 {-# INLINE buildRecordBatch #-}
@@ -53,7 +53,7 @@ buildRecordBatch !pid !epoch !baseSeq !comprAttr payloads =
 -- Used for compression: build records → compress → wrapRecordBatch.
 buildRecords :: [ByteString] -> ByteString
 buildRecords payloads =
-  let !size = computeRecordsSize payloads
+  let !(# size, _ #) = computeRecordsSizeAndCount payloads
   in unsafeCreate size $ \ptr -> writeAllRecords ptr payloads 0
 
 -- | Wrap compressed records with the 61-byte batch header.
@@ -135,15 +135,16 @@ writeRecord !p !index !payload = do
 -- Size computation (pure, no allocations)
 ------------------------------------------------------------------------
 
-computeRecordsSize :: [ByteString] -> Int
-computeRecordsSize = go 0 0
+-- | Returns (# totalRecordsSize, payloadCount #) in a single pass.
+computeRecordsSizeAndCount :: [ByteString] -> (# Int, Int #)
+computeRecordsSizeAndCount = go 0 0
   where
-    go !acc !_ [] = acc
+    go !acc !i [] = (# acc, i #)
     go !acc !i (payload : rest) =
       let !payloadLen = BS.length payload
           !bodySize = 1 + 1 + zigzagSize i + 1 + zigzagSize payloadLen + payloadLen + 1
       in go (acc + zigzagSize bodySize + bodySize) (i + 1) rest
-{-# INLINE computeRecordsSize #-}
+{-# INLINE computeRecordsSizeAndCount #-}
 
 ------------------------------------------------------------------------
 -- Zigzag varint
