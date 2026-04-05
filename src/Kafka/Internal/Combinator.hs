@@ -38,7 +38,6 @@ module Kafka.Internal.Combinator
   )
   where
 
-import Control.Applicative (liftA2)
 import Control.Monad (replicateM)
 import Data.Bits (testBit, clearBit, (.&.), (.|.), shiftL)
 import Data.Int (Int8, Int16, Int32, Int64)

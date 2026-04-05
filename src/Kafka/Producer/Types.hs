@@ -11,6 +11,7 @@ module Kafka.Producer.Types
   , Offset(..)
   , Headers
   , Header(..)
+  , DeliveryEntry(..)
   ) where
 
 import Data.ByteString (ByteString)
@@ -29,28 +30,32 @@ data ProducerRecord = ProducerRecord
 -- | Partition selection strategy.
 data ProducePartition
   = SpecifiedPartition {-# UNPACK #-} !Int32
-    -- ^ Send to this specific partition.
   | UnassignedPartition
-    -- ^ Let the producer choose (round-robin, or key-hash if key present).
   deriving (Eq, Show, Ord)
 
--- | Offset assigned by the broker on successful produce.
+-- | Offset assigned by the broker.
 newtype Offset = Offset { unOffset :: Int64 }
   deriving (Eq, Show, Ord)
 
--- | The result of producing a message, delivered asynchronously.
+-- | The result of producing a message.
 data DeliveryReport
   = DeliverySuccess !ProducerRecord !Offset
-    -- ^ Message was successfully produced at this offset.
   | DeliveryFailure !ProducerRecord !ByteString
-    -- ^ Message could not be produced. The ByteString is the error description.
   deriving (Eq, Show)
 
--- | Record header: a key-value pair attached to a message (KIP-82).
+-- | Record header (KIP-82).
 data Header = Header
   { hdrKey   :: !ByteString
   , hdrValue :: !(Maybe ByteString)
   } deriving (Eq, Show)
 
--- | List of record headers.
 type Headers = [Header]
+
+-- | Internal: a delivery report plus its optional per-message callback.
+-- The broker thread pushes these to the delivery queue. The poller
+-- thread drains the queue, invokes callbacks, and returns the reports.
+data DeliveryEntry = DeliveryEntry
+  { deReport   :: !DeliveryReport
+  , deCallback :: !(Maybe (DeliveryReport -> IO ()))
+    -- ^ Per-message callback, invoked by the poller thread (NOT broker thread).
+  }

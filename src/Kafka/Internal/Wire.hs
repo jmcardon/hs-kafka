@@ -63,10 +63,12 @@ module Kafka.Internal.Wire
   , remaining
   , ensure
   , eof
-  , count
   , parseBool
+    -- * Re-export
+  , replicateM
   ) where
 
+import Control.Monad (replicateM)
 import GHC.Exts
 import GHC.Int
 import GHC.Word
@@ -346,7 +348,7 @@ compactArray p = do
   n <- unsignedVarInt
   case n of
     0 -> pure []
-    _ -> count (n - 1) p
+    _ -> replicateM (n - 1) p
 {-# INLINE compactArray #-}
 
 -- | Skip tagged fields section.
@@ -420,15 +422,6 @@ parseBool = do
   pure (b /= 0)
 {-# INLINE parseBool #-}
 
--- | Parse exactly n items.
-count :: Int -> Wire a -> Wire [a]
-count n p = go n []
-  where
-    go 0 !acc = pure (reverse acc)
-    go i !acc = do
-      a <- p
-      go (i - 1) (a : acc)
-{-# INLINE count #-}
 
 ------------------------------------------------------------------------
 -- Legacy encoding (pre-flexible versions)
@@ -454,14 +447,14 @@ legacyNullableString = do
 legacyArray :: Wire a -> Wire [a]
 legacyArray p = do
   n <- int32
-  count (fromIntegral n) p
+  replicateM (fromIntegral n) p
 {-# INLINE legacyArray #-}
 
 -- | Legacy nullable array: INT32 count (-1 or 0 = empty).
 legacyNullableArray :: Wire a -> Wire [a]
 legacyNullableArray p = do
   n <- int32
-  if n <= 0 then pure [] else count (fromIntegral n) p
+  if n <= 0 then pure [] else replicateM (fromIntegral n) p
 {-# INLINE legacyNullableArray #-}
 
 -- | Legacy sized bytes: INT32 length + bytes.

@@ -24,10 +24,8 @@ import Foreign.Storable (poke)
 import System.IO.Unsafe (unsafeDupablePerformIO)
 
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
-
-import GHC.IO (IO(IO))
+import Foreign.Marshal.Utils (copyBytes)
 
 ------------------------------------------------------------------------
 -- Public API
@@ -65,7 +63,7 @@ wrapRecordBatch !pid !epoch !baseSeq !comprAttr !recordCount records =
       !totalSize = 61 + recordsSize
   in unsafeCreate totalSize $ \ptr -> do
     BSU.unsafeUseAsCStringLen records $ \(srcPtr, len) ->
-      BSI.memcpy (ptr `plusPtr` 61) (castPtr srcPtr) len
+      copyBytes (ptr `plusPtr` 61) (castPtr srcPtr) len
     writePostCrc ptr pid epoch baseSeq comprAttr recordCount
     let !crc = crc32cPtr (ptr `plusPtr` 21) (40 + recordsSize)
     writePreCrc ptr recordsSize crc
@@ -125,7 +123,7 @@ writeRecord !p !index !payload = do
   p3 <- pokeZigzag (p2 `plusPtr` 1) payloadLen  -- valueLength
   -- Copy payload bytes: use unsafeUseAsCStringLen to get Ptr, then memcpy
   BSU.unsafeUseAsCStringLen payload $ \(srcPtr, len) ->
-    BSI.memcpy p3 (castPtr srcPtr) len
+    copyBytes p3 (castPtr srcPtr) len
   let !p4 = p3 `plusPtr` payloadLen
   poke p4 (0 :: Word8)                 -- headerCount (zigzag 0)
   pure (p4 `plusPtr` 1)

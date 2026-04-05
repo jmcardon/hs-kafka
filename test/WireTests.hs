@@ -270,14 +270,14 @@ combinatorTests = testGroup "Combinators"
   , testCase "ensure too many fails" $
       shouldFail (parse (ensure 4) "abc")
 
-  , testCase "count 0 returns empty list" $
-      parse (count 0 word8) "" `shouldBe` ([] :: [Word8])
+  , testCase "replicateM 0 returns empty list" $
+      parse (replicateM 0 word8) "" `shouldBe` ([] :: [Word8])
 
-  , testCase "count 3 parses 3 items" $
-      parse (count 3 word8) "\x01\x02\x03" `shouldBe` [1, 2, 3]
+  , testCase "replicateM 3 parses 3 items" $
+      parse (replicateM 3 word8) "\x01\x02\x03" `shouldBe` [1, 2, 3]
 
-  , testCase "count exceeds input fails" $
-      shouldFail (parse (count 4 word8) "\x01\x02\x03")
+  , testCase "replicateM exceeds input fails" $
+      shouldFail (parse (replicateM 4 word8) "\x01\x02\x03")
   ]
 
 ------------------------------------------------------------------------

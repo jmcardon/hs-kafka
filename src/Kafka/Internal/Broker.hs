@@ -89,11 +89,12 @@ data PendingMessage = PendingMessage
   , pmHeaders        :: !Headers
     -- ^ Record headers (for record batch encoding).
   , pmCallback       :: !(Maybe (DeliveryReport -> IO ()))
-    -- ^ Per-message callback (from produceWithCallback).
-  , pmGlobalCallback :: !(Maybe (DeliveryReport -> IO ()))
-    -- ^ Global callback reference (from producer config).
-  , pmDeliveryQueue  :: !(TBQueue DeliveryReport)
-    -- ^ Delivery report queue (for pollEvents).
+    -- ^ Per-message callback. Stored in DeliveryEntry, invoked by the poller.
+  , pmSyncVar        :: !(Maybe (TMVar DeliveryReport))
+    -- ^ For sync produce: broker thread writes here directly (lightweight STM).
+    -- This is NOT a user callback — just a TMVar put.
+  , pmDeliveryQueue  :: !(TBQueue DeliveryEntry)
+    -- ^ Shared delivery queue. Broker thread pushes DeliveryEntry here.
   , pmRetriesLeft    :: {-# UNPACK #-} !Int
   }
 
@@ -131,6 +132,7 @@ batchIsEmpty :: Batch -> Bool
 batchIsEmpty b = batchCount b == 0
 {-# INLINE batchIsEmpty #-}
 
+{-# INLINE batchAdd #-}
 batchAdd :: Batch -> TopicName -> Int32 -> PendingMessage -> Batch
 batchAdd (Batch groups cnt bytes) topic part msg = Batch
   { batchGroups = Map.alter addMsg (topic, part) groups
@@ -550,19 +552,17 @@ dispatchProduceResponse env topic callbacks prodResp = do
     failAll msgs errBS = forM_ msgs $ \m ->
       deliverReport m (DeliveryFailure (pmRecord m) errBS)
 
-    -- Route a delivery report through: per-message callback, global callback, queue.
+    -- Push delivery entry to queue + fill sync TMVar. No user callbacks.
     deliverReport :: PendingMessage -> DeliveryReport -> IO ()
-    deliverReport m dr = do
-      case pmCallback m of
-        Just cb -> cb dr
-        Nothing -> pure ()
-      case pmGlobalCallback m of
-        Just cb -> cb dr
-        Nothing -> pure ()
-      -- Best-effort push to delivery queue (drop if full)
-      atomically $ do
-        full <- isFullTBQueue (pmDeliveryQueue m)
-        unless full $ writeTBQueue (pmDeliveryQueue m) dr
+    deliverReport m dr = atomically $ do
+      -- Fill sync TMVar if present (for sync produce)
+      case pmSyncVar m of
+        Just var -> void $ tryPutTMVar var dr
+        Nothing  -> pure ()
+      -- Push to delivery queue (for pollEvents)
+      let !entry = DeliveryEntry dr (pmCallback m)
+      full <- isFullTBQueue (pmDeliveryQueue m)
+      unless full $ writeTBQueue (pmDeliveryQueue m) entry
 
 ------------------------------------------------------------------------
 -- Failure handling
@@ -585,18 +585,15 @@ failAllInflight env = do
         forM_ msgs $ \m ->
           deliverReportIO m (DeliveryFailure (pmRecord m) "broker connection lost")
 
--- | Deliver a report via callbacks + queue (IO version for use outside dispatch).
+-- | Push a delivery entry to the queue (IO version for use outside dispatch).
 deliverReportIO :: PendingMessage -> DeliveryReport -> IO ()
-deliverReportIO m dr = do
-  case pmCallback m of
-    Just cb -> cb dr
-    Nothing -> pure ()
-  case pmGlobalCallback m of
-    Just cb -> cb dr
-    Nothing -> pure ()
-  atomically $ do
-    full <- isFullTBQueue (pmDeliveryQueue m)
-    unless full $ writeTBQueue (pmDeliveryQueue m) dr
+deliverReportIO m dr = atomically $ do
+  case pmSyncVar m of
+    Just var -> void $ tryPutTMVar var dr
+    Nothing  -> pure ()
+  let !entry = DeliveryEntry dr (pmCallback m)
+  full <- isFullTBQueue (pmDeliveryQueue m)
+  unless full $ writeTBQueue (pmDeliveryQueue m) entry
 
 ------------------------------------------------------------------------
 -- Correlation ID

@@ -27,8 +27,7 @@ import Data.Maybe (mapMaybe)
 
 import qualified Data.Foldable as F
 
-import GHC.Exts (Addr#, eqAddr#)
-import GHC.ForeignPtr (ForeignPtrContents)
+import GHC.Exts (eqAddr#)
 
 import Kafka.Common (TopicName(..))
 import Kafka.Internal.Wire
@@ -198,7 +197,7 @@ varintNullableBytes = do
 varintArray :: Wire a -> Wire [a]
 varintArray p = do
   n <- signedVarInt
-  count n p
+  replicateM n p
 {-# INLINE varintArray #-}
 
 parseHeader :: Wire Header

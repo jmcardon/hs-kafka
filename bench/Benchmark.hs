@@ -13,13 +13,11 @@ import qualified Data.Text as Text
 
 -- kafka-native
 import qualified "kafka" Kafka.Client as Native
-import qualified "kafka" Kafka.Common as Native
 import qualified "kafka" Kafka.Internal.Config as Native
 import qualified "kafka" Kafka.Producer as Native
 
 -- hw-kafka-client
 import qualified "hw-kafka-client" Kafka.Producer as HW
-import qualified "hw-kafka-client" Kafka.Types as HW
 
 -- mock cluster (shared FFI to librdkafka)
 import MockCluster

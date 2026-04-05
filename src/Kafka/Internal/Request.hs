@@ -16,7 +16,6 @@ module Kafka.Internal.Request
   ) where
 
 import Control.Exception (try, IOException)
-import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as BSL
 import Data.IORef
 import qualified Network.Socket.ByteString.Lazy as NBSL

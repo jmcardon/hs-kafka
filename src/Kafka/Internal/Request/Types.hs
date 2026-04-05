@@ -6,8 +6,6 @@ module Kafka.Internal.Request.Types where
 
 import Data.ByteString (ByteString)
 import Data.Int (Int8, Int32)
-import Data.IORef (IORef)
-import System.IO (Handle)
 
 import Kafka.Common
 import Kafka.Internal.ShowDebug

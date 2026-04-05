@@ -33,15 +33,12 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, registerDelay)
 import Control.Monad hiding (join)
-import Control.Monad.Except hiding (join)
-import Control.Monad.Reader hiding (join)
-import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
+import Control.Monad.Except
+import Control.Monad.Reader
 import Data.Coerce (coerce)
 import Data.Foldable
 import Data.Int (Int16, Int32, Int64)
 import Data.IntMap (IntMap)
-import Data.IORef (IORef, newIORef)
 import qualified Data.List as List
 import Data.Maybe
 import Network.Socket (HostName, ServiceName)
@@ -53,11 +50,9 @@ import Kafka.Common
 import Kafka.Internal.Request
 import Kafka.Internal.Request.Types
 import Kafka.Internal.Fetch.Response
-import Kafka.Internal.JoinGroup.Response (Member, parseJoinGroupResponse)
+import Kafka.Internal.JoinGroup.Response (Member)
 import Kafka.Internal.FindCoordinator.Response (parseFindCoordinatorResponse)
-import Kafka.Internal.LeaveGroup.Response (parseLeaveGroupResponse)
-import Kafka.Internal.Heartbeat.Response (parseHeartbeatResponse)
-import Kafka.Internal.ListOffsets.Response (ListOffsetsResponse, parseListOffsetsResponse)
+import Kafka.Internal.ListOffsets.Response (ListOffsetsResponse)
 import Kafka.Internal.SyncGroup.Response (SyncTopicAssignment)
 import Kafka.Internal.Response (parseResponse)
 import Kafka.Internal.Topic
@@ -195,7 +190,6 @@ getListedOffsets allIndices = do
 initializeOffsets :: [Int32] -> Consumer ()
 initializeOffsets assignedPartitions = do
   ConsumerState {..} <- getv
-  let ConsumerSettings {..} = settings
   withSocket sock $ do
     initialOffs <- getListedOffsets assignedPartitions
     latestOffs <- latestOffsets assignedPartitions

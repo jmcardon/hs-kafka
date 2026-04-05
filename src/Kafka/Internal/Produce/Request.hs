@@ -18,7 +18,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
 import Data.Int (Int16, Int32, Int64)
 
-import Kafka.Common (TopicName(..), correlationId)
+import Kafka.Common (TopicName(..))
 import Kafka.Internal.Compression (compressBatch)
 import Kafka.Internal.Config (Compression(..))
 import Kafka.Internal.RecordBatch (buildRecordBatch, buildRecords, wrapRecordBatch)

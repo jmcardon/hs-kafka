@@ -28,7 +28,7 @@ parseApiVersionsResponse = do
   _correlationId <- int32
   errCode <- int16
   arrayLen <- int32
-  entries <- count (fromIntegral arrayLen) parseApiVersionEntry
+  entries <- replicateM (fromIntegral arrayLen) parseApiVersionEntry
   pure (ApiVersionsResponse errCode entries 0)
 
 parseApiVersionEntry :: Wire ApiVersionEntry

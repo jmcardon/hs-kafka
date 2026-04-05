@@ -22,7 +22,6 @@ module Kafka.Client
   ) where
 
 import Control.Concurrent.STM
-import Control.Monad (forM_, unless)
 import Data.Int (Int32)
 import Data.ByteString (ByteString)
 import Data.IntMap.Strict (IntMap)

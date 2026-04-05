@@ -6,7 +6,7 @@ module Kafka.Internal.SyncGroup.Request
 
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
-import Data.Int (Int16, Int32)
+import Data.Int (Int16)
 
 import Kafka.Common
 import Kafka.Internal.Writer

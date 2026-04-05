@@ -8,7 +8,6 @@ module Kafka.Internal.Produce.Response
   , parseProduceResponseV9
   ) where
 
-import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32, Int64)
 
 import Kafka.Common (TopicName(..))
@@ -37,7 +36,7 @@ parseProduceResponse :: Wire ProduceResponse
 parseProduceResponse = do
   _correlationId <- int32
   responsesCount <- int32
-  msgs <- count (fromIntegral responsesCount) parseProduceResponseMessage
+  msgs <- replicateM (fromIntegral responsesCount) parseProduceResponseMessage
   throttle <- int32
   pure (ProduceResponse msgs throttle)
 
@@ -46,7 +45,7 @@ parseProduceResponseMessage = do
   tlen <- int16
   t <- takeBytes (fromIntegral tlen)
   prc <- int32
-  resps <- count (fromIntegral prc) parseProducePartitionResponse
+  resps <- replicateM (fromIntegral prc) parseProducePartitionResponse
   pure (ProduceResponseMessage (TopicName t) resps)
 
 parseProducePartitionResponse :: Wire ProducePartitionResponse
