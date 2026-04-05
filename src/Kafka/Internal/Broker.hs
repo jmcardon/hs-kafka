@@ -2,6 +2,7 @@
     BangPatterns
   , DerivingStrategies
   , LambdaCase
+  , OverloadedStrings
   , ScopedTypeVariables
   #-}
 
@@ -31,7 +32,6 @@ module Kafka.Internal.Broker
   , newBrokerEnv
   , startBrokerThread
   , stopBroker
-  , enqueueProduce
   , enqueueRequest
   , setIdempotentState
   ) where
@@ -51,6 +51,7 @@ import Data.ByteString (ByteString)
 import Numeric.Natural (Natural)
 
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
@@ -58,6 +59,7 @@ import qualified Network.Socket.ByteString as NBS
 import qualified Network.Socket.ByteString.Lazy as NBSL
 
 import Kafka.Common
+import Kafka.Producer.Types
 import Kafka.Internal.ApiVersions.Request (apiVersionsRequest)
 import Kafka.Internal.ApiVersions.Response (ApiVersionsResponse(..), ApiVersionEntry(..),
   parseApiVersionsResponse)
@@ -78,9 +80,21 @@ data BrokerState = BrokerInit | BrokerDown | BrokerConnecting | BrokerUp
 
 -- | A message waiting to be batched and sent.
 data PendingMessage = PendingMessage
-  { pmPayload     :: !ByteString
-  , pmResult      :: !(TMVar (Either KafkaException ()))
-  , pmRetriesLeft :: {-# UNPACK #-} !Int
+  { pmRecord         :: !ProducerRecord
+    -- ^ Original record (for delivery reports).
+  , pmPayload        :: !ByteString
+    -- ^ Value bytes to encode in the record batch.
+  , pmKey            :: !(Maybe ByteString)
+    -- ^ Key bytes (for record batch encoding).
+  , pmHeaders        :: !Headers
+    -- ^ Record headers (for record batch encoding).
+  , pmCallback       :: !(Maybe (DeliveryReport -> IO ()))
+    -- ^ Per-message callback (from produceWithCallback).
+  , pmGlobalCallback :: !(Maybe (DeliveryReport -> IO ()))
+    -- ^ Global callback reference (from producer config).
+  , pmDeliveryQueue  :: !(TBQueue DeliveryReport)
+    -- ^ Delivery report queue (for pollEvents).
+  , pmRetriesLeft    :: {-# UNPACK #-} !Int
   }
 
 -- | Operations enqueued to a broker thread.
@@ -214,16 +228,6 @@ stopBroker env = atomically $ do
 ------------------------------------------------------------------------
 -- Public: enqueue operations
 ------------------------------------------------------------------------
-
--- | Enqueue a message for batched produce. Returns a TMVar that will
--- be filled with the delivery result.
-enqueueProduce :: BrokerEnv -> TopicName -> Int32 -> ByteString
-              -> IO (TMVar (Either KafkaException ()))
-enqueueProduce env topic part payload = do
-  result <- newEmptyTMVarIO
-  let msg = PendingMessage payload result (ccRetries (beConfig env))
-  atomically $ writeTBQueue (beOps env) (BrokerProduce topic part msg)
-  pure result
 
 -- | Enqueue a pre-encoded request (metadata, fetch, etc.).
 -- Returns a TMVar that will be filled with the raw response bytes.
@@ -427,9 +431,10 @@ sendPartitionBatch env kafka ((topic, part), msgsRev) = do
   result <- try @IOException $ NBS.sendAll (getSocket kafka) reqBytes
   case result of
     Left err -> do
-      let kafkaErr = Left (KafkaIOError (show err))
+      let errBS = BS8.pack (show err)
+      forM_ msgs $ \m ->
+        deliverReportIO m (DeliveryFailure (pmRecord m) errBS)
       atomically $ do
-        forM_ msgs $ \m -> void $ tryPutTMVar (pmResult m) kafkaErr
         modifyTVar' (beInflight env) $ IM.delete (fromIntegral corrId)
         modifyTVar' (beInflightCount env) (subtract 1)
     Right () -> pure ()
@@ -496,9 +501,9 @@ dispatchResponse env responseBytes = do
       -- Parse the ProduceResponse to get per-partition error codes
       case Wire.runWire parseProduceResponseV9 responseBytes of
         Nothing ->
-          let err = Left (KafkaParseException "failed to parse ProduceResponse")
-          in atomically $ forM_ callbacks $ \(_part, msgs) ->
-               forM_ msgs $ \m -> void $ tryPutTMVar (pmResult m) err
+          forM_ callbacks $ \(_part, msgs) ->
+            forM_ msgs $ \m ->
+              deliverReportIO m (DeliveryFailure (pmRecord m) "failed to parse ProduceResponse")
         Just prodResp ->
           dispatchProduceResponse env topic callbacks prodResp
 
@@ -510,35 +515,54 @@ dispatchProduceResponse :: BrokerEnv
                        -> ProduceResponse
                        -> IO ()
 dispatchProduceResponse env topic callbacks prodResp = do
-  -- Build a map of partition → error code from the response
-  let partErrors = Map.fromList
-        [ (prResponsePartition pr, prResponseErrorCode pr)
+  -- Build a map of partition → (errorCode, baseOffset)
+  let partResults = Map.fromList
+        [ (prResponsePartition pr, (prResponseErrorCode pr, prResponseBaseOffset pr))
         | msg <- produceResponseMessages prodResp
         , pr  <- prPartitionResponses msg
         ]
   forM_ callbacks $ \(part, msgs) ->
-    case Map.lookup part partErrors of
-      -- No entry or error code 0 → success
-      Nothing     -> completeAll msgs (Right ())
-      Just 0      -> completeAll msgs (Right ())
-      Just errCode -> case fromErrorCode errCode of
+    case Map.lookup part partResults of
+      Nothing ->
+        deliverAll msgs (Offset 0)  -- no entry → treat as success
+      Just (0, baseOff) ->
+        deliverAll msgs (Offset baseOff)
+      Just (errCode, _) -> case fromErrorCode errCode of
         Nothing ->
-          completeAll msgs (Left (KafkaUnexpectedErrorCodeException errCode))
+          failAll msgs (BS8.pack ("unknown error code: " ++ show errCode))
         Just protoErr
           | isRetriable protoErr ->
-              -- Retriable: re-enqueue individually (writeTBQueue may block,
-              -- so we can't batch with tryPutTMVar in one transaction)
               forM_ msgs $ \m ->
                 if pmRetriesLeft m > 0
                   then atomically $ writeTBQueue (beOps env)
                     (BrokerProduce topic part m { pmRetriesLeft = pmRetriesLeft m - 1 })
-                  else atomically $ void $ tryPutTMVar (pmResult m)
-                    (Left (KafkaProtocolException protoErr))
+                  else deliverReport m (DeliveryFailure (pmRecord m) (BS8.pack (show protoErr)))
           | otherwise ->
-              completeAll msgs (Left (KafkaProtocolException protoErr))
+              forM_ msgs $ \m ->
+                deliverReport m (DeliveryFailure (pmRecord m) (BS8.pack (show protoErr)))
   where
-    completeAll msgs result = atomically $
-      forM_ msgs $ \m -> void $ tryPutTMVar (pmResult m) result
+    -- Deliver success reports with sequential offsets starting at baseOffset.
+    deliverAll [] _ = pure ()
+    deliverAll (m:rest) !off = do
+      deliverReport m (DeliverySuccess (pmRecord m) off)
+      deliverAll rest (Offset (unOffset off + 1))
+
+    failAll msgs errBS = forM_ msgs $ \m ->
+      deliverReport m (DeliveryFailure (pmRecord m) errBS)
+
+    -- Route a delivery report through: per-message callback, global callback, queue.
+    deliverReport :: PendingMessage -> DeliveryReport -> IO ()
+    deliverReport m dr = do
+      case pmCallback m of
+        Just cb -> cb dr
+        Nothing -> pure ()
+      case pmGlobalCallback m of
+        Just cb -> cb dr
+        Nothing -> pure ()
+      -- Best-effort push to delivery queue (drop if full)
+      atomically $ do
+        full <- isFullTBQueue (pmDeliveryQueue m)
+        unless full $ writeTBQueue (pmDeliveryQueue m) dr
 
 ------------------------------------------------------------------------
 -- Failure handling
@@ -553,12 +577,26 @@ failAllInflight env = do
     writeTVar (beInflightCount env) 0
     pure m
   let err = Left (KafkaException "broker connection lost")
-  atomically $ forM_ (IM.elems entries) $ \case
+  forM_ (IM.elems entries) $ \case
     InflightRaw respVar ->
-      void $ tryPutTMVar respVar err
+      atomically $ void $ tryPutTMVar respVar err
     InflightBatch _ callbacks ->
       forM_ callbacks $ \(_, msgs) ->
-        forM_ msgs $ \m -> void $ tryPutTMVar (pmResult m) err
+        forM_ msgs $ \m ->
+          deliverReportIO m (DeliveryFailure (pmRecord m) "broker connection lost")
+
+-- | Deliver a report via callbacks + queue (IO version for use outside dispatch).
+deliverReportIO :: PendingMessage -> DeliveryReport -> IO ()
+deliverReportIO m dr = do
+  case pmCallback m of
+    Just cb -> cb dr
+    Nothing -> pure ()
+  case pmGlobalCallback m of
+    Just cb -> cb dr
+    Nothing -> pure ()
+  atomically $ do
+    full <- isFullTBQueue (pmDeliveryQueue m)
+    unless full $ writeTBQueue (pmDeliveryQueue m) dr
 
 ------------------------------------------------------------------------
 -- Correlation ID

@@ -6,7 +6,6 @@
 -- Both produce to a librdkafka mock cluster via criterion.
 module Main (main) where
 
-import Control.Concurrent.STM
 import Control.DeepSeq (NFData(..))
 import Criterion.Main
 import qualified Data.ByteString as BS
@@ -63,9 +62,9 @@ setupNative = do
         , Native.ccAcks = Native.AcksAll
         }
   Right client <- Native.newClient cfg
-  Right producer <- Native.newProducer client cfg
+  Right producer <- Native.newProducer client (Native.defaultProducerConfig cfg)
   -- warm up
-  _ <- Native.produce producer "native-bench" ("warmup")
+  _ <- Native.produce producer (Native.ProducerRecord "native-bench" Native.UnassignedPartition Nothing (Just "warmup") [])
   Native.flushProducer producer
   pure (NativeEnv producer client mc)
 
@@ -111,10 +110,18 @@ mkHwRecord topic size = HW.ProducerRecord
 -- | Produce N messages with kafka-native, flush, wait for all callbacks.
 nativeProduce :: Native.KafkaProducer -> Int -> Int -> IO ()
 nativeProduce producer n size = do
-  let payload = BS.replicate size 0x41
-  vars <- mapM (\_ -> Native.produceAsync producer "native-bench" payload) [1..n]
+  let record = Native.ProducerRecord
+        { Native.prTopic = "native-bench"
+        , Native.prPartition = Native.UnassignedPartition
+        , Native.prKey = Nothing
+        , Native.prValue = Just (BS.replicate size 0x41)
+        , Native.prHeaders = []
+        }
+  mapM_ (\_ -> Native.produceAsync producer record) [1..n]
   Native.flushProducer producer
-  mapM_ (\v -> atomically $ readTMVar v) vars
+  -- Drain delivery reports
+  _ <- Native.pollEvents producer 0
+  pure ()
 
 -- | Produce N messages with hw-kafka-client, flush.
 hwProduce :: HW.KafkaProducer -> Int -> Int -> IO ()

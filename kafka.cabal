@@ -13,6 +13,7 @@ library
     Kafka.Common
     Kafka.Consumer
     Kafka.Producer
+    Kafka.Producer.Types
 
     Kafka.Internal.ApiVersions.Request
     Kafka.Internal.ApiVersions.Response
