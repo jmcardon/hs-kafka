@@ -16,7 +16,8 @@ module Kafka.Internal.RecordBatch
 import Data.Bits ((.&.), (.|.), shiftR, shiftL, xor)
 import Data.ByteString (ByteString)
 import Data.ByteString.Internal (unsafeCreate)
-import Data.Digest.CRC32C (crc32cUpdate)
+import Foreign.C.Types (CSize(..))
+import System.IO.Unsafe (unsafeDupablePerformIO)
 import Data.Int (Int16, Int32, Int64)
 import Data.Primitive.ByteArray (ByteArray(ByteArray), sizeofByteArray)
 import Data.Primitive.Unlifted.Array (UnliftedArray, sizeofUnliftedArray, indexUnliftedArray)
@@ -29,7 +30,6 @@ import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
 
 import GHC.Exts (Int(..), Int#, ByteArray#, copyByteArrayToAddr#)
-import GHC.ForeignPtr (ForeignPtr(ForeignPtr))
 import GHC.IO (IO(IO))
 import GHC.Ptr (Ptr(Ptr))
 
@@ -50,8 +50,7 @@ buildRecordBatch !pid !epoch !baseSeq !comprAttr payloads =
     writeAllRecords (ptr `plusPtr` 61) payloads n
     writePostCrc ptr pid epoch baseSeq comprAttr n
     -- CRC over postCrc(40 bytes at offset 21) + records
-    let !crcSlice = BSI.BS (ptrToFP (ptr `plusPtr` 21)) (40 + recordsSize)
-        !crc = crc32cUpdate 0 crcSlice
+    let !crc = crc32cPtr (ptr `plusPtr` 21) (40 + recordsSize)
     writePreCrc ptr recordsSize crc
 {-# INLINE buildRecordBatch #-}
 
@@ -74,8 +73,7 @@ wrapRecordBatch !pid !epoch !baseSeq !comprAttr !recordCount records =
     BSU.unsafeUseAsCStringLen records $ \(srcPtr, len) ->
       BSI.memcpy (ptr `plusPtr` 61) (castPtr srcPtr) len
     writePostCrc ptr pid epoch baseSeq comprAttr recordCount
-    let !crcSlice = BSI.BS (ptrToFP (ptr `plusPtr` 21)) (40 + recordsSize)
-        !crc = crc32cUpdate 0 crcSlice
+    let !crc = crc32cPtr (ptr `plusPtr` 21) (40 + recordsSize)
     writePreCrc ptr recordsSize crc
 
 ------------------------------------------------------------------------
@@ -213,12 +211,14 @@ poke64BE p v = poke (castPtr p :: Ptr Word64) (byteSwap64 (fromIntegral v))
 {-# INLINE poke64BE #-}
 
 ------------------------------------------------------------------------
--- ForeignPtr helper
+-- CRC32C — direct FFI call on Ptr, no ByteString construction
 ------------------------------------------------------------------------
 
--- | Wrap a Ptr as a ForeignPtr with no finalizer.
--- UNSAFE: only valid within unsafeCreate's callback where the
--- enclosing ForeignPtr keeps the memory alive.
-ptrToFP :: Ptr Word8 -> ForeignPtr Word8
-ptrToFP (Ptr addr#) = ForeignPtr addr# (error "ptrToFP: touched finalizer")
-{-# INLINE ptrToFP #-}
+foreign import ccall unsafe "crc32c/crc32c.h crc32c_extend"
+  c_crc32c_extend :: Word32 -> Ptr Word8 -> CSize -> IO Word32
+
+-- | Compute CRC32C over a region of memory. No allocation.
+crc32cPtr :: Ptr Word8 -> Int -> Word32
+crc32cPtr ptr len = unsafeDupablePerformIO $
+  c_crc32c_extend 0 ptr (fromIntegral len)
+{-# INLINE crc32cPtr #-}
