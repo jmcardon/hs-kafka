@@ -12,6 +12,8 @@ library
     Kafka.Client
     Kafka.Common
     Kafka.Consumer
+    Kafka.Consumer.New
+    Kafka.Consumer.Types
     Kafka.Producer
     Kafka.Producer.Types
 
