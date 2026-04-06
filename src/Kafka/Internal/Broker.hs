@@ -81,7 +81,9 @@ data BrokerState = BrokerInit | BrokerDown | BrokerConnecting | BrokerUp
 
 -- | A message waiting to be batched and sent.
 data PendingMessage = PendingMessage
-  { pmRecord         :: !ProducerRecord
+  { pmEnqueueTime    :: {-# UNPACK #-} !Int64
+    -- ^ Monotonic time (microseconds) when this message was enqueued.
+  , pmRecord         :: !ProducerRecord
     -- ^ Original record (for delivery reports).
   , pmPayload        :: !ByteString
     -- ^ Value bytes to encode in the record batch.
@@ -256,9 +258,11 @@ brokerThreadMain env = do
     _ <- try @SomeException $ withKafka host (show port) $ \kafka -> do
       atomically $ writeTVar (beState env) BrokerUp
       resetBackoff (beReconnect env)
+      invokeLogCallback env LogInfo ("broker " ++ show (beNodeId env) ++ " connected")
       runBrokerSession env kafka
     -- Session ended
     atomically $ writeTVar (beState env) BrokerDown
+    invokeErrorCallback env ("broker " ++ show (beNodeId env) ++ " disconnected")
     failAllInflight env
     -- Reconnect with backoff (unless shutting down)
     done' <- readTVarIO (beShutdown env)
@@ -607,6 +611,20 @@ deliverReportIO m dr = atomically $ do
   let !entry = DeliveryEntry dr (pmCallback m)
   full <- isFullTBQueue (pmDeliveryQueue m)
   unless full $ writeTBQueue (pmDeliveryQueue m) entry
+
+------------------------------------------------------------------------
+-- Callbacks
+------------------------------------------------------------------------
+
+invokeLogCallback :: BrokerEnv -> LogLevel -> String -> IO ()
+invokeLogCallback env level msg = case ccLogCallback (beConfig env) of
+  Just cb -> cb level msg
+  Nothing -> pure ()
+
+invokeErrorCallback :: BrokerEnv -> String -> IO ()
+invokeErrorCallback env msg = case ccErrorCallback (beConfig env) of
+  Just cb -> cb msg
+  Nothing -> pure ()
 
 ------------------------------------------------------------------------
 -- Correlation ID

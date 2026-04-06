@@ -42,6 +42,7 @@ module Kafka.Producer
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
+import GHC.Clock (getMonotonicTimeNSec)
 import Control.Concurrent.STM
 import Data.Int (Int32, Int64, Int16)
 import Data.IORef (IORef, newIORef, atomicModifyIORef')
@@ -225,9 +226,11 @@ sendRecordSync producer record var = do
       case mBroker of
         Nothing -> pure (Left (KafkaException "no broker available"))
         Just env -> do
+          now <- getMonotonicTimeNSec
           drQueue <- resolveDeliveryQueue producer
           let pm = PendingMessage
-                { pmRecord = record
+                { pmEnqueueTime = fromIntegral (now `div` 1000)  -- ns → μs
+                , pmRecord = record
                 , pmPayload = case prValue record of { Just v -> v; Nothing -> "" }
                 , pmKey = prKey record
                 , pmHeaders = prHeaders record
@@ -239,7 +242,7 @@ sendRecordSync producer record var = do
           atomically $ writeTBQueue (beOps env) (BrokerProduce topic part pm)
           pure (Right ())
 
--- | Internal: async produce. No sync TMVar, delivery reports via queue/callbacks.
+-- | Internal: async produce.
 sendRecord :: KafkaProducer -> ProducerRecord
            -> Maybe (DeliveryReport -> IO ())
            -> IO (Either KafkaException ())
@@ -254,13 +257,12 @@ sendRecord producer record mCb = do
       case mBroker of
         Nothing -> pure (Left (KafkaException "no broker available"))
         Just env -> do
-          -- Resolve the delivery queue (default or forwarded)
+          now <- getMonotonicTimeNSec
           drQueue <- resolveDeliveryQueue producer
           let pm = PendingMessage
-                { pmRecord = record
-                , pmPayload = case prValue record of
-                    Just v  -> v
-                    Nothing -> ""
+                { pmEnqueueTime = fromIntegral (now `div` 1000)
+                , pmRecord = record
+                , pmPayload = case prValue record of { Just v -> v; Nothing -> "" }
                 , pmKey = prKey record
                 , pmHeaders = prHeaders record
                 , pmCallback = mCb
