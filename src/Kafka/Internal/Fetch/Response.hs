@@ -16,6 +16,7 @@ module Kafka.Internal.Fetch.Response
   , Record(..)
   , RecordBatch(..)
   , parseFetchResponse
+  , parseFetchResponseV12
   , partitionLastSeenOffset
   ) where
 
@@ -216,3 +217,49 @@ partitionLastSeenOffset fetchResponse t partitionId = do
     recordBatchLastOffset rb =
       baseOffset rb + fromIntegral (lastOffsetDelta rb) + 1
     maxMaybe xs = fmap (F.foldr1 max) (nonEmpty xs)
+
+------------------------------------------------------------------------
+-- Fetch v12 (flexible encoding)
+------------------------------------------------------------------------
+
+-- | Parse Fetch v12+ response (flexible/compact encoding).
+-- Response header v1: correlation_id + tagged_fields.
+parseFetchResponseV12 :: Wire FetchResponse
+parseFetchResponseV12 = do
+  _correlationId <- int32
+  skipTaggedFields  -- response header v1
+  throttle <- int32
+  errCode <- int16
+  sessionId <- int32
+  topicsList <- compactArray parseFetchTopicV12
+  skipTaggedFields  -- body tagged fields
+  pure (FetchResponse throttle errCode sessionId topicsList)
+
+parseFetchTopicV12 :: Wire FetchTopic
+parseFetchTopicV12 = do
+  tn <- compactString
+  parts <- compactArray parseFetchPartitionV12
+  skipTaggedFields
+  pure (FetchTopic (TopicName tn) parts)
+{-# INLINE parseFetchTopicV12 #-}
+
+parseFetchPartitionV12 :: Wire FetchPartition
+parseFetchPartitionV12 = do
+  hdr <- parsePartitionHeaderV12
+  batches <- parseNullableRecordBatches
+  skipTaggedFields
+  pure (FetchPartition hdr batches)
+{-# INLINE parseFetchPartitionV12 #-}
+
+parsePartitionHeaderV12 :: Wire PartitionHeader
+parsePartitionHeaderV12 = PartitionHeader
+  <$> int32 <*> int16 <*> int64 <*> int64 <*> int64
+  <*> compactArray parseAbortedTransactionV12
+{-# INLINE parsePartitionHeaderV12 #-}
+
+parseAbortedTransactionV12 :: Wire AbortedTransaction
+parseAbortedTransactionV12 = do
+  at <- AbortedTransaction <$> int64 <*> int64
+  skipTaggedFields
+  pure at
+{-# INLINE parseAbortedTransactionV12 #-}
