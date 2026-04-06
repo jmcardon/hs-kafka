@@ -21,6 +21,7 @@ module Kafka.Consumer.New
   ( -- * Lifecycle
     newConsumer
   , closeConsumer
+  , withConsumer
     -- * Polling
   , consumerPoll
     -- * Offsets
@@ -32,6 +33,7 @@ module Kafka.Consumer.New
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.STM
+import Control.Exception (mask, onException)
 import Control.Monad (void, unless, when, forM_, forM)
 import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32, Int64)
@@ -98,6 +100,18 @@ newConsumer client cfg = do
   pure (Right consumer)
 
 -- | Close the consumer. Leaves the group and stops background threads.
+-- | Bracket-based consumer lifecycle.
+withConsumer :: KafkaClient -> ConsumerConfig
+            -> (KafkaConsumer -> IO a) -> IO (Either KafkaException a)
+withConsumer client cfg action = mask $ \restore -> do
+  result <- newConsumer client cfg
+  case result of
+    Left err -> pure (Left err)
+    Right consumer -> do
+      a <- restore (action consumer) `onException` closeConsumer consumer
+      closeConsumer consumer
+      pure (Right a)
+
 closeConsumer :: KafkaConsumer -> IO ()
 closeConsumer consumer = atomically $ writeTVar (consShutdown consumer) True
 

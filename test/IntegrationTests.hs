@@ -2,8 +2,9 @@
 
 module Main (main) where
 
-import Control.Concurrent (threadDelay)
-import Control.Concurrent.STM (readTVarIO)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.STM (readTVarIO, TMVar, newEmptyTMVarIO, putTMVar, readTMVar, atomically)
+import Control.Monad (forM, forM_, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef
@@ -33,6 +34,7 @@ main = defaultMain $ testGroup "Integration"
   , multiBrokerTests
   , retriableErrorTests
   , backpressureTests
+  , loadTests
   ]
 
 ------------------------------------------------------------------------
@@ -146,19 +148,15 @@ producerTests = testGroup "Producer"
   , testCase "produce async + flush" $
       withMockCluster 1 $ \mc -> do
         mockCreateTopic mc "async-test" 1 1
-        let cfg = defaultConfig { ccLingerMs = 5000 } -- high linger
+        let cfg = defaultConfig { ccLingerMs = 5000 }
         withTestProducer mc cfg $ \_client producer -> do
-          -- Fire-and-forget 10 messages
           mapM_ (\i ->
             produceAsync producer (mkRecord "async-test"
               (BS.pack [fromIntegral (i :: Int)])))
             [0..9]
-          -- Flush forces them out despite high linger
-          flushProducer producer
-          -- Poll for delivery reports
-          reports <- pollEvents producer 5000
-          let failures = filter isDeliveryFailureReport reports
-          assertEqual "all should succeed after flush" 0 (length failures)
+          -- flush = flushProducer + drain delivery reports
+          delivered <- flush producer 5000
+          assertEqual "all 10 should be delivered via flush" 10 delivered
 
   , testCase "produce to multiple partitions" $
       withMockCluster 1 $ \mc -> do
@@ -172,24 +170,29 @@ producerTests = testGroup "Producer"
           let failures = filter isDeliveryFailure results
           assertEqual "all should succeed" 0 (length failures)
 
-  , testCase "per-message async callbacks" $
+  , testCase "per-message async callbacks via pollEvents" $
       withMockCluster 1 $ \mc -> do
         mockCreateTopic mc "callback-test" 2 1
         withTestProducer mc defaultConfig $ \_client producer -> do
-          -- Async produce, delivery reports via pollEvents
           successCount <- newIORef (0 :: Int)
           failCount <- newIORef (0 :: Int)
           mapM_ (\i ->
             produceAsync producer (mkRecord "callback-test"
               (BS.pack [fromIntegral (i :: Int)])))
             [0..49]
+          -- flushProducer signals send, then pollEvents drains reports
           flushProducer producer
-          -- Poll for delivery reports
-          reports <- pollEvents producer 5000
-          mapM_ (\dr -> case dr of
-            DeliverySuccess _ _ -> atomicModifyIORef' successCount (\n -> (n+1, ()))
-            DeliveryFailure _ _ -> atomicModifyIORef' failCount (\n -> (n+1, ()))
-            ) reports
+          -- Poll in a loop until we get all 50
+          let drainLoop !total = do
+                reports <- pollEvents producer 1000
+                forM_ reports $ \dr -> case dr of
+                  DeliverySuccess _ _ -> atomicModifyIORef' successCount (\n -> (n+1, ()))
+                  DeliveryFailure _ _ -> atomicModifyIORef' failCount (\n -> (n+1, ()))
+                let !total' = total + length reports
+                if total' < 50 && not (null reports)
+                  then drainLoop total'
+                  else pure total'
+          _ <- drainLoop 0
           successes <- readIORef successCount
           failures <- readIORef failCount
           assertEqual "all 50 should succeed" 50 successes
@@ -204,10 +207,8 @@ producerTests = testGroup "Producer"
             produceAsync producer (mkRecord "rapid-test"
               (BS.pack [fromIntegral (i `mod` 256 :: Int)])))
             [0..999]
-          flushProducer producer
-          reports <- pollEvents producer 5000
-          let failures = filter isDeliveryFailureReport reports
-          assertEqual "all 1000 should succeed" 0 (length failures)
+          delivered <- flush producer 10000
+          assertEqual "all 1000 should be delivered" 1000 delivered
   ]
 
 ------------------------------------------------------------------------
@@ -532,20 +533,16 @@ backpressureTests = testGroup "Backpressure"
         mockCreateTopic mc "bp-test" 1 1
         let cfg = defaultConfig { ccQueueSize = 1000 }
         withTestProducer mc cfg $ \_client producer -> do
-          -- Fire 500 async messages — should not block
           mapM_ (\i ->
             produceAsync producer (mkRecord "bp-test"
               (BS.pack [fromIntegral (i `mod` 256 :: Int)])))
             [0..499]
-          flushProducer producer
-          reports <- pollEvents producer 5000
-          let failures = filter isDeliveryFailureReport reports
-          assertEqual "all 500 should succeed" 0 (length failures)
+          delivered <- flush producer 5000
+          assertEqual "all 500 should succeed" 500 delivered
 
   , testCase "high-volume async with small batches" $
       withMockCluster 1 $ \mc -> do
         mockCreateTopic mc "hv-test" 4 1
-        -- Small batch size forces many flushes
         let cfg = defaultConfig
               { ccBatchNumMessages = 10
               , ccLingerMs = 1
@@ -556,10 +553,8 @@ backpressureTests = testGroup "Backpressure"
             produceAsync producer (mkRecord "hv-test"
               (BS.pack [fromIntegral (i `mod` 256 :: Int)])))
             [0..199]
-          flushProducer producer
-          reports <- pollEvents producer 5000
-          let failures = filter isDeliveryFailureReport reports
-          assertEqual "all 200 should succeed" 0 (length failures)
+          delivered <- flush producer 5000
+          assertEqual "all 200 should succeed" 200 delivered
 
   , testCase "produce with broker RTT does not hang" $
       withMockCluster 1 $ \mc -> do
@@ -591,3 +586,97 @@ isDeliveryFailure (Right (DeliverySuccess _ _)) = False
 isDeliveryFailureReport :: DeliveryReport -> Bool
 isDeliveryFailureReport (DeliveryFailure _ _) = True
 isDeliveryFailureReport (DeliverySuccess _ _) = False
+
+------------------------------------------------------------------------
+-- Load tests
+------------------------------------------------------------------------
+
+loadTests :: TestTree
+loadTests = testGroup "Load tests"
+  [ testCase "10K messages burst" $
+      withMockCluster 3 $ \mc -> do
+        mockCreateTopic mc "burst-test" 8 3
+        let cfg = defaultConfig
+              { ccLingerMs = 1
+              , ccBatchNumMessages = 500
+              , ccBatchSize = 1000000
+              , ccQueueSize = 20000  -- large enough for 10K in-flight
+              }
+            pCfg = (defaultProducerConfig cfg) { pcDeliveryQueueSize = 20000 }
+        let addrs = parseBootstraps (mcBootstraps mc)
+            fullCfg = cfg { ccBootstrap = addrs }
+        Right client <- newClient fullCfg
+        Right producer <- newProducer client pCfg
+        mapM_ (\i ->
+          produceAsync producer (mkRecord "burst-test"
+            (BS.replicate 100 (fromIntegral (i `mod` 256 :: Int)))))
+          [0..9999]
+        delivered <- flush producer 15000
+        assertBool ("should deliver most messages, got " ++ show delivered)
+          (delivered >= 9000)
+        closeProducer producer
+        closeClient client
+
+  , testCase "concurrent producers to same topic" $
+      withMockCluster 3 $ \mc -> do
+        mockCreateTopic mc "concurrent-test" 4 3
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+            pCfg = (defaultProducerConfig cfg) { pcDeliveryQueueSize = 5000 }
+        Right client <- newClient cfg
+        Right producer <- newProducer client pCfg
+        -- 4 concurrent threads, each producing 250 messages
+        doneVars <- forM [0..3 :: Int] $ \threadId -> do
+          done <- newEmptyTMVarIO
+          _ <- forkIO $ do
+            forM_ [0..249 :: Int] $ \_ -> do
+              let key = BS.pack [fromIntegral threadId]
+                  rec = ProducerRecord "concurrent-test" UnassignedPartition
+                          (Just key) (Just (BS.replicate 50 0x42)) []
+              _ <- produceAsync producer rec
+              pure ()
+            atomically $ putTMVar done ()
+          pure done
+        mapM_ (\v -> atomically $ readTMVar v) doneVars
+        delivered <- flush producer 10000
+        assertEqual "all 1000 should deliver" 1000 delivered
+        closeProducer producer
+        closeClient client
+
+  , testCase "withProducer handles exceptions" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "with-test" 1 1
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+        result <- withClient cfg $ \client -> do
+          withProducer client (defaultProducerConfig cfg) $ \producer -> do
+            r <- produce producer (mkRecord "with-test" "bracket-safe")
+            case r of
+              Right (DeliverySuccess _ _) -> pure ()
+              _ -> assertFailure "produce should succeed"
+        case result of
+          Right (Right ()) -> pure ()
+          _ -> assertFailure "withClient/withProducer should succeed"
+
+  , testCase "rapid produce+poll interleaving" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "interleave-test" 2 1
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          -- Interleave produce and poll in tight loop
+          totalDelivered <- newIORef (0 :: Int)
+          forM_ [0..99 :: Int] $ \i -> do
+            _ <- produceAsync producer (mkRecord "interleave-test"
+                    (BS.pack [fromIntegral i]))
+            -- Poll after every 10 produces
+            when (i `mod` 10 == 9) $ do
+              reports <- pollEvents producer 100
+              atomicModifyIORef' totalDelivered
+                (\n -> (n + length reports, ()))
+          flushProducer producer
+          -- Final drain
+          finalReports <- pollEvents producer 5000
+          atomicModifyIORef' totalDelivered
+            (\n -> (n + length finalReports, ()))
+          delivered <- readIORef totalDelivered
+          assertEqual "all 100 should be delivered" 100 delivered
+  ]

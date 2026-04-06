@@ -27,7 +27,10 @@ module Kafka.Producer
     -- * Lifecycle
   , newProducer
   , closeProducer
+  , withProducer
   , flushProducer
+  , flush
+  , drainDeliveryReports
   , rotatePartitions
     -- * Producing
   , produce
@@ -43,6 +46,7 @@ module Kafka.Producer
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar, readMVar)
+import Control.Exception (mask, onException)
 import Control.Monad (void, forM_)
 import Data.Foldable (traverse_)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -161,6 +165,19 @@ initIdempotentState client = do
                   { isProducerId = ipProducerId resp
                   , isProducerEpoch = ipProducerEpoch resp
                   , isSequences = seqs }
+
+-- | Bracket-based producer lifecycle. Flushes and closes on exit/exception.
+withProducer :: KafkaClient -> ProducerConfig
+            -> (KafkaProducer -> IO a) -> IO (Either KafkaException a)
+withProducer client cfg action = mask $ \restore -> do
+  result <- newProducer client cfg
+  case result of
+    Left err -> pure (Left err)
+    Right producer -> do
+      let cleanup = flushProducer producer >> closeProducer producer
+      a <- restore (action producer) `onException` cleanup
+      cleanup
+      pure (Right a)
 
 closeProducer :: KafkaProducer -> IO ()
 closeProducer _ = pure ()
@@ -339,18 +356,53 @@ invokeCallbacks globalCb (DeliveryEntry dr mCb) = do
 -- Flush
 ------------------------------------------------------------------------
 
+-- | Signal all broker threads to send pending batches immediately and
+-- wait for the send to complete. Does NOT drain delivery reports —
+-- use 'pollEvents' or 'flush' for that.
+--
+-- This is a low-level primitive. Most users want 'flush' instead.
 flushProducer :: KafkaProducer -> IO ()
 flushProducer producer = do
   brokers <- readTVarIO (kcBrokers (kpClient producer))
   doneVars <- mapM flushOne (IM.elems brokers)
   atomically $ mapM_ readTMVar doneVars
-  -- Rotate sticky partitions for next batch
   rotatePartitions producer
   where
     flushOne env = do
       done <- newEmptyTMVarIO
       atomically $ writeTBQueue (beControlOps env) (BrokerFlush done)
       pure done
+
+-- | Flush and drain delivery reports. Matches rd_kafka_flush semantics:
+--
+-- 1. Signals all broker threads to send immediately (ignores linger.ms)
+-- 2. Waits for batches to be sent
+-- 3. Polls delivery reports (invoking callbacks) until the queue is
+--    empty or @timeoutMs@ expires
+--
+-- The timeout does NOT cancel mid-drain — it only limits how long we
+-- wait for reports to arrive. Returns the number of reports processed.
+flush :: KafkaProducer -> Int -> IO Int
+flush producer timeoutMs = do
+  flushProducer producer
+  drainDeliveryReports producer timeoutMs
+
+-- | Drain delivery reports, invoking callbacks via 'pollEvents'.
+-- Keeps polling until the queue is empty (after receiving at least one
+-- batch of reports) or timeout expires.
+drainDeliveryReports :: KafkaProducer -> Int -> IO Int
+drainDeliveryReports producer timeoutMs = go 0 timeoutMs False
+  where
+    go !count !remaining !hadReports
+      | remaining <= 0 = pure count
+      | otherwise = do
+          let pollMs = min 200 remaining
+          reports <- pollEvents producer pollMs
+          if null reports
+            then if hadReports
+              then pure count  -- had reports, now empty → settled
+              else go count (remaining - pollMs) False  -- keep waiting
+            else go (count + length reports) (remaining - pollMs) True
 
 ------------------------------------------------------------------------
 -- Internal: metadata + partitioning

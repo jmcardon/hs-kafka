@@ -15,6 +15,7 @@ module Kafka.Client
   , MetadataCache(..)
   , newClient
   , closeClient
+  , withClient
   , anyBroker
   , refreshTopicMetadata
   , partitionCountFor
@@ -23,6 +24,7 @@ module Kafka.Client
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.STM
+import Control.Exception (mask, onException)
 import Control.Monad (void, unless, forM_)
 import Data.Int (Int32)
 import Data.ByteString (ByteString)
@@ -108,6 +110,18 @@ newClient cfg = case ccBootstrap cfg of
       else do
         closeClient client
         pure (Left (KafkaException "could not connect to any bootstrap server"))
+
+-- | Bracket-based client lifecycle. Guarantees cleanup on exception.
+-- Uses mask to prevent async exceptions between creation and cleanup registration.
+withClient :: ClientConfig -> (KafkaClient -> IO a) -> IO (Either KafkaException a)
+withClient cfg action = mask $ \restore -> do
+  result <- newClient cfg
+  case result of
+    Left err -> pure (Left err)
+    Right client -> do
+      a <- restore (action client) `onException` closeClient client
+      closeClient client
+      pure (Right a)
 
 -- | Shut down all broker threads and clean up.
 closeClient :: KafkaClient -> IO ()
