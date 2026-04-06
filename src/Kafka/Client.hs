@@ -21,7 +21,9 @@ module Kafka.Client
   , leaderBrokerFor
   ) where
 
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.STM
+import Control.Monad (void, unless, forM_)
 import Data.Int (Int32)
 import Data.ByteString (ByteString)
 import Data.IntMap.Strict (IntMap)
@@ -97,7 +99,12 @@ newClient cfg = case ccBootstrap cfg of
     -- Wait for at least one broker to reach BrokerUp (with timeout)
     connected <- waitForAnyBroker client 10000000 -- 10s timeout
     if connected
-      then pure (Right client)
+      then do
+        -- Start periodic metadata refresh thread if configured
+        let refreshMs = ccMetadataMaxAgeMs cfg
+        unless (refreshMs <= 0) $
+          void $ forkIO $ metadataRefreshLoop client refreshMs
+        pure (Right client)
       else do
         closeClient client
         pure (Left (KafkaException "could not connect to any bootstrap server"))
@@ -217,20 +224,48 @@ updateMetadataCache client resp = do
           | mb <- metaBrokers
           , Just env <- [Map.lookup (metaBrokerAddrKey mb) addrMap]
           ]
-    -- Only update if we found matches (don't lose brokers)
     if not (IM.null rekeyed)
       then writeTVar (kcBrokers client) rekeyed
       else pure ()
+  -- Discover new brokers not in the current map
+  let cfg = kcConfig client
+  currentMap <- readTVarIO (kcBrokers client)
+  let currentAddrs = Map.fromList
+        [ (brokerAddrKey (beBrokerAddress env), ())
+        | env <- IM.elems currentMap
+        ]
+      newBrokers = [ mb | mb <- metaBrokers
+                   , Map.notMember (metaBrokerAddrKey mb) currentAddrs ]
+  forM_ newBrokers $ \mb -> do
+    let addr = BrokerAddress (BS8.unpack (M.host mb)) (fromIntegral (M.port mb))
+    env <- newBrokerEnv cfg (M.nodeId mb) addr
+    startBrokerThread env
+    atomically $ modifyTVar' (kcBrokers client) $
+      IM.insert (fromIntegral (M.nodeId mb)) env
   where
     brokerAddrKey :: BrokerAddress -> (String, Int)
     brokerAddrKey (BrokerAddress h p) = (h, fromIntegral p)
-
     metaBrokerAddrKey :: MetadataBroker -> (String, Int)
     metaBrokerAddrKey mb = (BS8.unpack (M.host mb), fromIntegral (M.port mb))
 
 ------------------------------------------------------------------------
 -- Internal helpers
 ------------------------------------------------------------------------
+
+-- | Periodic metadata refresh loop. Refreshes metadata for all known
+-- topics at the configured interval. Stops when kcShutdown is set.
+metadataRefreshLoop :: KafkaClient -> Int -> IO ()
+metadataRefreshLoop client intervalMs = do
+  threadDelay (intervalMs * 1000)
+  done <- readTVarIO (kcShutdown client)
+  unless done $ do
+    -- Get all known topics from the cache
+    meta <- readTVarIO (kcMetadata client)
+    let topics = Map.keys (mcPartitionCounts meta)
+    -- Refresh each topic's metadata (errors are silently ignored)
+    forM_ topics $ \topic ->
+      void (refreshTopicMetadata client topic)
+    metadataRefreshLoop client intervalMs
 
 -- | Wait until at least one broker reaches BrokerUp state, or timeout.
 -- Returns True if a broker connected, False on timeout.

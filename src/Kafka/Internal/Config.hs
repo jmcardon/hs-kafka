@@ -13,6 +13,7 @@ module Kafka.Internal.Config
   , ClientConfig(..)
   , Compression(..)
   , Acknowledgments(..)
+  , LogLevel(..)
   , defaultConfig
   , acksToInt16
   , compressionAttribute
@@ -79,7 +80,25 @@ data ClientConfig = ClientConfig
   , ccRetries          :: {-# UNPACK #-} !Int
     -- ^ Number of retries for retriable errors.
     -- Default: 3
+  , ccMetadataMaxAgeMs :: {-# UNPACK #-} !Int
+    -- ^ Maximum age of metadata before forced refresh.
+    -- Maps to librdkafka topic.metadata.refresh.interval.ms.
+    -- Default: 300000 (5 minutes). Set to -1 to disable.
+  , ccMessageTimeoutMs :: {-# UNPACK #-} !Int
+    -- ^ Maximum time a message can wait in the producer queue.
+    -- Maps to librdkafka message.timeout.ms.
+    -- Default: 300000 (5 minutes). Set to 0 for infinite.
+  , ccLogCallback     :: !(Maybe (LogLevel -> String -> IO ()))
+    -- ^ Log callback. Called for internal log messages.
+  , ccErrorCallback   :: !(Maybe (String -> IO ()))
+    -- ^ Error callback. Called for non-message errors (connection failures, etc).
+  , ccStatsCallback   :: !(Maybe (String -> IO ()))
+    -- ^ Statistics callback. Called periodically with JSON stats.
   }
+
+-- | Log severity levels.
+data LogLevel = LogDebug | LogInfo | LogWarn | LogError
+  deriving (Eq, Ord, Show)
 
 -- | Compression codec. Stored in bits 0-2 of record batch attributes.
 data Compression
@@ -126,4 +145,9 @@ defaultConfig = ClientConfig
   , ccMaxInFlight      = 5
   , ccIdempotent       = False
   , ccRetries          = 3
+  , ccMetadataMaxAgeMs = 300000
+  , ccMessageTimeoutMs = 300000
+  , ccLogCallback     = Nothing
+  , ccErrorCallback   = Nothing
+  , ccStatsCallback   = Nothing
   }
