@@ -176,6 +176,7 @@ benchmark throughput
   build-depends:
     , base
     , bytestring
+    , containers
     , criterion
     , deepseq
     , hw-kafka-client

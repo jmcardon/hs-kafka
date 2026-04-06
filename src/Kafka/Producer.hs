@@ -30,6 +30,7 @@ module Kafka.Producer
   , withProducer
   , flushProducer
   , flush
+  , FlushResult(..)
   , drainDeliveryReports
   , rotatePartitions
   , outboundQueueLength
@@ -180,8 +181,11 @@ withProducer client cfg action = mask $ \restore -> do
       cleanup
       pure (Right a)
 
+-- | Close the producer. Currently a no-op since broker threads are
+-- owned by KafkaClient. Call closeClient to shut everything down.
 closeProducer :: KafkaProducer -> IO ()
-closeProducer _ = pure ()
+closeProducer _producer = pure ()
+-- Future: could drain pending messages, cancel poller thread, etc.
 
 ------------------------------------------------------------------------
 -- Queue forwarding
@@ -373,6 +377,10 @@ flushProducer producer = do
       done <- newEmptyTMVarIO
       atomically $ writeTBQueue (beControlOps env) (BrokerFlush done)
       pure done
+
+-- | Result of a flush operation.
+data FlushResult = FlushOk !Int | FlushTimedOut !Int
+  deriving (Eq, Show)
 
 -- | Flush and drain delivery reports. Matches rd_kafka_flush semantics:
 --

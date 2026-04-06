@@ -394,17 +394,16 @@ fetchLoop consumer = do
           respVar <- enqueueRequest env fetchReq
           response <- atomically $ readTMVar respVar
           case response of
-            Left _ -> pure ()
+            Left _err -> pure ()  -- Broker error — will retry next cycle
             Right bytes -> case Wire.runWire F.parseFetchResponse bytes of
-              Nothing -> pure ()
+              Nothing -> pure ()  -- Parse error — will retry next cycle
               Just fetchResp -> do
                 let records = extractRecords (tpTopic tp) fetchResp
                     maxOff = if null records then currentOff
                              else maximum (map crOffset records) + 1
+                -- Enqueue records + update offset in one transaction
                 atomically $ do
-                  forM_ records $ \r -> do
-                    full <- isFullTBQueue (consFetchQueue consumer)
-                    unless full $ writeTBQueue (consFetchQueue consumer) r
+                  forM_ records $ writeTBQueue (consFetchQueue consumer)
                   modifyTVar' (consGroupState consumer) $ \s ->
                     s { cgsOffsets = Map.insert (tpTopic tp, tpPartition tp) maxOff (cgsOffsets s) }
     threadDelay (ccFetchWaitMs cfg * 1000)

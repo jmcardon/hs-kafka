@@ -533,14 +533,16 @@ dispatchResponse env responseBytes = do
       Nothing -> pure Nothing
       Just entry -> do
         writeTVar (beInflight env) (IM.delete corrId m)
+        -- Decrement in-flight count atomically with removal
+        case entry of
+          InflightBatch _ _ -> modifyTVar' (beInflightCount env) (subtract 1)
+          _ -> pure ()
         pure (Just entry)
   case mEntry of
-    Nothing -> pure ()  -- orphaned response, ignore
+    Nothing -> pure ()
     Just (InflightRaw respVar) ->
       void $ atomically $ tryPutTMVar respVar (Right responseBytes)
     Just (InflightBatch topic callbacks) -> do
-      -- Decrement in-flight count
-      atomically $ modifyTVar' (beInflightCount env) (subtract 1)
       -- Parse the ProduceResponse to get per-partition error codes
       case Wire.runWire parseProduceResponseV9 responseBytes of
         Nothing -> do
@@ -597,7 +599,7 @@ dispatchProduceResponse env topic callbacks prodResp = do
     -- Push delivery entry to queue + fill sync TMVar. No user callbacks.
     deliverReport :: PendingMessage -> DeliveryReport -> IO ()
     deliverReport m dr = atomically $ do
-      traverse_ (\var -> void $ tryPutTMVar var dr) (pmSyncVar m)
+      traverse_ (\var -> putTMVar var dr) (pmSyncVar m)
       let !entry = DeliveryEntry dr (pmCallback m)
       full <- isFullTBQueue (pmDeliveryQueue m)
       unless full $ writeTBQueue (pmDeliveryQueue m) entry
@@ -636,7 +638,7 @@ toRecordInput pm = RecordInput
 
 deliverReportIO :: PendingMessage -> DeliveryReport -> IO ()
 deliverReportIO m dr = atomically $ do
-  traverse_ (\var -> void $ tryPutTMVar var dr) (pmSyncVar m)
+  traverse_ (\var -> putTMVar var dr) (pmSyncVar m)
   let !entry = DeliveryEntry dr (pmCallback m)
   full <- isFullTBQueue (pmDeliveryQueue m)
   unless full $ writeTBQueue (pmDeliveryQueue m) entry
