@@ -132,6 +132,25 @@ test-suite integration
   default-language: GHC2024
   ghc-options:      -Wall -O2 -threaded
 
+executable producer-bench
+  main-is:          ProducerBench.hs
+  other-modules:    MockCluster
+  hs-source-dirs:   examples test
+  build-depends:
+    , base
+    , bytestring
+    , kafka
+    , stm
+  extra-libraries:  rdkafka
+  if os(darwin)
+    extra-lib-dirs:   /opt/homebrew/lib
+    include-dirs:     /opt/homebrew/include
+  if os(linux)
+    extra-lib-dirs:   /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu
+    include-dirs:     /usr/include /usr/include/librdkafka
+  default-language: GHC2024
+  ghc-options:      -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N2 -A64m -s"
+
 benchmark wire-parse
   type:             exitcode-stdio-1.0
   main-is:          WireBench.hs
