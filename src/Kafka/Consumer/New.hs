@@ -91,6 +91,10 @@ newConsumer client cfg = do
   -- Start the consumer group management thread
   void $ forkIO $ consumerGroupThread consumer
 
+  -- Start auto-commit timer if configured
+  when (ccAutoCommit cfg) $
+    void $ forkIO $ autoCommitLoop consumer
+
   pure (Right consumer)
 
 -- | Close the consumer. Leaves the group and stops background threads.
@@ -372,4 +376,19 @@ heartbeatThread consumer = do
                 atomically $ modifyTVar' (consGroupState consumer) $ \s ->
                   s { cgsJoinState = JoinInit }
     heartbeatThread consumer
+
+------------------------------------------------------------------------
+-- Auto-commit loop
+------------------------------------------------------------------------
+
+autoCommitLoop :: KafkaConsumer -> IO ()
+autoCommitLoop consumer = do
+  let intervalMs = ccAutoCommitMs (consConfig consumer)
+  threadDelay (intervalMs * 1000)
+  done <- readTVarIO (consShutdown consumer)
+  unless done $ do
+    state <- readTVarIO (consGroupState consumer)
+    when (cgsJoinState state == JoinSteady && not (Map.null (cgsOffsets state))) $
+      void $ commitSync consumer
+    autoCommitLoop consumer
 

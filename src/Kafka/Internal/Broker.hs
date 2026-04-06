@@ -261,6 +261,7 @@ brokerThreadMain env = do
   done <- readTVarIO (beShutdown env)
   unless done $ do
     atomically $ writeTVar (beState env) BrokerConnecting
+    invokeLogCallback env LogDebug ("connecting to broker " ++ show (beNodeId env))
     let BrokerAddress host port = beBrokerAddress env
     _ <- try @SomeException $ withKafka host (show port) $ \kafka -> do
       atomically $ writeTVar (beState env) BrokerUp
@@ -275,6 +276,7 @@ brokerThreadMain env = do
     done' <- readTVarIO (beShutdown env)
     unless done' $ do
       delayUs <- nextBackoffDelay (beReconnect env)
+      invokeLogCallback env LogInfo ("reconnecting broker " ++ show (beNodeId env) ++ " in " ++ show (delayUs `div` 1000) ++ "ms")
       threadDelay delayUs
       brokerThreadMain env
 
@@ -471,6 +473,7 @@ sendPartitionBatch env kafka ((topic, part), msgsRev) = do
   result <- try @IOException $ NBS.sendAll (getSocket kafka) reqBytes
   case result of
     Left err -> do
+      invokeErrorCallback env ("send failed on broker " ++ show (beNodeId env) ++ ": " ++ show err)
       let errBS = BS8.pack (show err)
       forM_ msgs $ \m ->
         deliverReportIO m (DeliveryFailure (pmRecord m) errBS)
@@ -540,7 +543,8 @@ dispatchResponse env responseBytes = do
       atomically $ modifyTVar' (beInflightCount env) (subtract 1)
       -- Parse the ProduceResponse to get per-partition error codes
       case Wire.runWire parseProduceResponseV9 responseBytes of
-        Nothing ->
+        Nothing -> do
+          invokeErrorCallback env "failed to parse ProduceResponse"
           forM_ callbacks $ \(_part, msgs) ->
             forM_ msgs $ \m ->
               deliverReportIO m (DeliveryFailure (pmRecord m) "failed to parse ProduceResponse")
