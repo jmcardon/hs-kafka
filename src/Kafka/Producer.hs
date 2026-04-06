@@ -28,6 +28,7 @@ module Kafka.Producer
   , newProducer
   , closeProducer
   , flushProducer
+  , rotatePartitions
     -- * Producing
   , produce
   , produceAsync
@@ -41,11 +42,12 @@ module Kafka.Producer
   , module Kafka.Producer.Types
   ) where
 
-import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
+import Control.Concurrent.MVar (MVar, newMVar, modifyMVar, readMVar)
+import Control.Monad (void, forM_)
 import GHC.Clock (getMonotonicTimeNSec)
 import Control.Concurrent.STM
 import Data.Int (Int32, Int64, Int16)
-import Data.IORef (IORef, newIORef, atomicModifyIORef')
+import Data.IORef (IORef, newIORef, readIORef, atomicModifyIORef')
 import Data.Map.Strict (Map)
 import Numeric.Natural (Natural)
 
@@ -347,10 +349,12 @@ flushProducer producer = do
   brokers <- readTVarIO (kcBrokers (kpClient producer))
   doneVars <- mapM flushOne (IM.elems brokers)
   atomically $ mapM_ readTMVar doneVars
+  -- Rotate sticky partitions for next batch
+  rotatePartitions producer
   where
     flushOne env = do
       done <- newEmptyTMVarIO
-      atomically $ writeTBQueue (beOps env) (BrokerFlush done)
+      atomically $ writeTBQueue (beControlOps env) (BrokerFlush done)
       pure done
 
 ------------------------------------------------------------------------
@@ -377,16 +381,29 @@ selectPartition producer record count = case prPartition record of
   SpecifiedPartition p -> pure p
   UnassignedPartition -> case prKey record of
     Just key -> pure (fromIntegral (murmur2 key `mod` count))
-    Nothing  -> nextPartitionRR producer (prTopic record) count
+    Nothing  -> stickyPartition producer (prTopic record) count
 
-nextPartitionRR :: KafkaProducer -> TopicName -> Int32 -> IO Int32
-nextPartitionRR producer topic count = do
+-- | Sticky partition: returns the same partition for a topic until
+-- rotatePartitions is called (on batch flush). Improves batching.
+stickyPartition :: KafkaProducer -> TopicName -> Int32 -> IO Int32
+stickyPartition producer topic _count = do
   ref <- modifyMVar (kpCounters producer) $ \m ->
     case Map.lookup topic m of
       Just ref -> pure (m, ref)
       Nothing -> do
         ref <- newIORef 0
         pure (Map.insert topic ref m, ref)
-  atomicModifyIORef' ref $ \n ->
-    let n' = if n + 1 >= fromIntegral count then 0 else n + 1
-    in (n', fromIntegral n)
+  fromIntegral <$> readIORef ref
+
+-- | Rotate sticky partition counters. Called after flush.
+rotatePartitions :: KafkaProducer -> IO ()
+rotatePartitions producer = do
+  counters <- readMVar (kpCounters producer)
+  forM_ (Map.toList counters) $ \(topic, ref) -> do
+    mCount <- partitionCountFor (kpClient producer) topic
+    case mCount of
+      Nothing -> pure ()
+      Just count ->
+        atomicModifyIORef' ref $ \n ->
+          let n' = if n + 1 >= fromIntegral count then 0 else n + 1
+          in (n', ())

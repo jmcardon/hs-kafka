@@ -37,11 +37,13 @@ module Kafka.Internal.Broker
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import GHC.Clock (getMonotonicTimeNSec)
 import Control.Concurrent.Async (race_)
 import Control.Concurrent.MVar (MVar, modifyMVar)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, IOException, try)
 import Control.Monad (unless, void, forM_)
+import Data.List (partition)
 import Data.Bits (shiftR)
 import Data.IntMap.Strict (IntMap)
 import Data.IORef
@@ -157,6 +159,8 @@ data BrokerEnv = BrokerEnv
   { beNodeId         :: {-# UNPACK #-} !Int32
   , beBrokerAddress  :: !BrokerAddress
   , beOps            :: !(TBQueue BrokerOp)
+  , beControlOps     :: !(TBQueue BrokerOp)
+    -- ^ High-priority ops (Flush, Shutdown). Checked before beOps.
   , beState          :: !(TVar BrokerState)
   , beInflight       :: !(TVar (IntMap InflightEntry))
   , beInflightCount  :: !(TVar Int)
@@ -186,6 +190,7 @@ data IdempotentRef = IdempotentRef
 newBrokerEnv :: ClientConfig -> Int32 -> BrokerAddress -> IO BrokerEnv
 newBrokerEnv cfg nodeId peer = do
   ops       <- newTBQueueIO (fromIntegral (ccQueueSize cfg) :: Natural)
+  ctrlOps   <- newTBQueueIO 16  -- small, for flush/shutdown only
   state     <- newTVarIO BrokerInit
   inflight  <- newTVarIO IM.empty
   inflightC <- newTVarIO 0
@@ -200,6 +205,7 @@ newBrokerEnv cfg nodeId peer = do
     { beNodeId         = nodeId
     , beBrokerAddress  = peer
     , beOps            = ops
+    , beControlOps     = ctrlOps
     , beState          = state
     , beInflight       = inflight
     , beInflightCount  = inflightC
@@ -228,7 +234,7 @@ startBrokerThread env = void $ forkIO (brokerThreadMain env)
 stopBroker :: BrokerEnv -> IO ()
 stopBroker env = atomically $ do
   writeTVar (beShutdown env) True
-  writeTBQueue (beOps env) BrokerShutdown
+  writeTBQueue (beControlOps env) BrokerShutdown
 
 ------------------------------------------------------------------------
 -- Public: enqueue operations
@@ -336,13 +342,19 @@ senderLoop env kafka = do
     cfg = beConfig env
     ops = beOps env
 
+    ctrlOps = beControlOps env
+
     go :: TVar Bool -> Batch -> IO ()
     go !lingerTimer !batch = do
       event <- if batchIsEmpty batch
-        -- No pending batch: just block on the next op
-        then OpEvent <$> atomically (readTBQueue ops)
-        -- Pending batch: race queue read vs linger timer
+        then atomically $
+              -- Priority: check control ops first
+              (OpEvent <$> readTBQueue ctrlOps)
+          `orElse`
+              (OpEvent <$> readTBQueue ops)
         else atomically $
+              (OpEvent <$> readTBQueue ctrlOps)
+          `orElse`
               (OpEvent <$> readTBQueue ops)
           `orElse`
               (do fired <- readTVar lingerTimer
@@ -384,12 +396,26 @@ data SenderEvent = OpEvent !BrokerOp | LingerFired
 ------------------------------------------------------------------------
 
 -- | Encode and send all accumulated produce messages.
--- Groups messages by (topic, partition), builds a ProduceRequest for
--- each group, assigns correlation IDs, and sends.
+-- Expires messages older than ccMessageTimeoutMs first.
 flushBatch :: BrokerEnv -> Kafka -> Batch -> IO ()
-flushBatch env kafka batch =
-  Map.foldlWithKey' (\act k v -> act >> sendPartitionBatch env kafka (k, v))
-    (pure ()) (batchGroups batch)
+flushBatch env kafka batch = do
+  let timeoutMs = ccMessageTimeoutMs (beConfig env)
+  if timeoutMs <= 0
+    then sendAll (batchGroups batch)
+    else do
+      nowUs <- fromIntegral . (`div` 1000) <$> getMonotonicTimeNSec
+      let cutoffUs = nowUs - fromIntegral timeoutMs * 1000
+      Map.foldlWithKey' (\act k msgs -> act >> do
+        let (expired, live) = partition (\m -> pmEnqueueTime m < cutoffUs) msgs
+        forM_ expired $ \m ->
+          deliverReportIO m (DeliveryFailure (pmRecord m) "message timed out")
+        unless (null live) $
+          sendPartitionBatch env kafka (k, live)
+        ) (pure ()) (batchGroups batch)
+  where
+    sendAll groups = Map.foldlWithKey'
+      (\act k v -> act >> sendPartitionBatch env kafka (k, v))
+      (pure ()) groups
 
 -- | Send a batch for a single (topic, partition) group.
 -- Blocks via STM if in-flight request count is at the limit.
