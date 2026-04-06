@@ -33,7 +33,7 @@ import Kafka.Internal.OffsetCommit.Request
 import Kafka.Internal.OffsetFetch.Request
 import Kafka.Internal.Config (Compression(..))
 import Kafka.Internal.RecordBatch (RecordInput(..))
-import Kafka.Internal.Produce.Request (buildProduceRequest)
+import Kafka.Internal.Produce.Request (ProduceRequestParams(..), buildProduceRequest)
 import Kafka.Internal.Request.Types
 import Kafka.Internal.ShowDebug
 import Kafka.Internal.SyncGroup.Request
@@ -66,9 +66,12 @@ produce kafka req@ProduceRequest{..} handle = do
   let Topic topicName parts ctr = produceTopic
   p <- fromIntegral <$> readIORef ctr
   let toRI v = RecordInput Nothing (Just v) [] 0
-      message = buildProduceRequest
-        correlationId 1 clientId (produceWaitTime `div` 1000)
-        topicName p (-1) (-1) (-1) NoCompression 0 (map toRI producePayloads)
+      message = buildProduceRequest ProduceRequestParams
+        { prpCorrId = correlationId, prpAcks = 1, prpClientId = clientId
+        , prpTimeoutMs = produceWaitTime `div` 1000, prpTopic = topicName
+        , prpPartition = p, prpProducerId = -1, prpProducerEpoch = -1
+        , prpBaseSequence = -1, prpCompression = NoCompression, prpFirstTs = 0
+        } (map toRI producePayloads)
   request kafka (BSL.fromStrict message) >>= \case
     Left err -> pure (Left err)
     Right a -> do

@@ -2,7 +2,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Kafka.Internal.Produce.Request
-  ( buildProduceRequest
+  ( ProduceRequestParams(..)
+  , buildProduceRequest
   ) where
 
 import Data.ByteString (ByteString)
@@ -22,73 +23,73 @@ produceApiVersion = 9
 produceApiKey :: Int16
 produceApiKey = 0
 
+-- | Parameters for building a produce request.
+data ProduceRequestParams = ProduceRequestParams
+  { prpCorrId        :: {-# UNPACK #-} !Int32
+  , prpAcks          :: {-# UNPACK #-} !Int16
+  , prpClientId      :: !ByteString
+  , prpTimeoutMs     :: {-# UNPACK #-} !Int
+  , prpTopic         :: !TopicName
+  , prpPartition     :: {-# UNPACK #-} !Int32
+  , prpProducerId    :: {-# UNPACK #-} !Int64
+  , prpProducerEpoch :: {-# UNPACK #-} !Int16
+  , prpBaseSequence  :: {-# UNPACK #-} !Int32
+  , prpCompression   :: !Compression
+  , prpFirstTs       :: {-# UNPACK #-} !Int64
+  }
+
 -- | Build a Produce v9 request as a strict ByteString.
-buildProduceRequest ::
-     Int32           -- ^ correlation ID
-  -> Int16           -- ^ acks
-  -> ByteString      -- ^ client ID
-  -> Int             -- ^ timeout (ms)
-  -> TopicName
-  -> Int32           -- ^ partition
-  -> Int64           -- ^ producerId
-  -> Int16           -- ^ producerEpoch
-  -> Int32           -- ^ baseSequence
-  -> Compression
-  -> Int64           -- ^ firstTimestamp (epoch ms, 0 for broker-assigned)
-  -> [RecordInput]   -- ^ records (key, value, headers, timestamp delta)
-  -> ByteString
-buildProduceRequest !corrId !acksVal !cid !timeout !topic !partition
-    !producerId !producerEpoch !baseSeq !compression !firstTs records =
+-- Single BuildR materialization — no intermediate BSL concatenation.
+buildProduceRequest :: ProduceRequestParams -> [RecordInput] -> ByteString
+buildProduceRequest !params records =
   let
     !n = length records
 
-    !batchBS = case compression of
+    !batchBS = case prpCompression params of
       NoCompression ->
-        buildRecordBatch producerId producerEpoch baseSeq 0 firstTs records
+        buildRecordBatch (prpProducerId params) (prpProducerEpoch params)
+          (prpBaseSequence params) 0 (prpFirstTs params) records
       _ ->
         let !rawRecords = buildRecords records
-            (!compRecords, !attr) = compressBatch compression rawRecords
+            (!compRecords, !attr) = compressBatch (prpCompression params) rawRecords
         in if attr == 0
-          then buildRecordBatch producerId producerEpoch baseSeq 0 firstTs records
-          else wrapRecordBatch producerId producerEpoch baseSeq attr n firstTs compRecords
+          then buildRecordBatch (prpProducerId params) (prpProducerEpoch params)
+                 (prpBaseSequence params) 0 (prpFirstTs params) records
+          else wrapRecordBatch (prpProducerId params) (prpProducerEpoch params)
+                 (prpBaseSequence params) attr n (prpFirstTs params) compRecords
 
     !batchLen = BS.length batchBS
+    TopicName !tn = prpTopic params
+    !topicLen = BS.length tn
 
     !prefixBuilder =
       int16 produceApiKey
       <> int16 produceApiVersion
-      <> int32 corrId
-      <> string cid
+      <> int32 (prpCorrId params)
+      <> string (prpClientId params)
       <> taggedFields
       <> compactNullableString Nothing
-      <> int16 acksVal
-      <> int32 (fromIntegral timeout)
+      <> int16 (prpAcks params)
+      <> int32 (fromIntegral (prpTimeoutMs params))
       <> unsignedVarInt 2
-      <> compactString (let TopicName tn = topic in tn)
+      <> compactString tn
       <> unsignedVarInt 2
-      <> int32 partition
+      <> int32 (prpPartition params)
       <> unsignedVarInt (batchLen + 1)
 
     !suffixBuilder = taggedFields <> taggedFields <> taggedFields
 
-    -- Compute body size arithmetically (no materialization needed)
-    TopicName !tn = topic
-    !topicLen = BS.length tn
-    !prefixSize = 24 + BS.length cid
+    -- Compute body size arithmetically
+    !prefixSize = 24 + BS.length (prpClientId params)
                 + uvarSize (topicLen + 1) + topicLen
                 + uvarSize (batchLen + 1)
-    !suffixSize = 3  -- three taggedFields (0x00 each)
-    !bodySize = fromIntegral (prefixSize + batchLen + suffixSize) :: Int32
+    !bodySize = fromIntegral (prefixSize + batchLen + 3) :: Int32
 
-    -- Build entire request as a single BuildR, materialize once
-    !fullRequest = int32 bodySize
-                <> prefixBuilder
-                <> bs batchBS
-                <> suffixBuilder
+    -- Single BuildR, single materialization
+    !fullRequest = int32 bodySize <> prefixBuilder <> bs batchBS <> suffixBuilder
 
   in BSL.toStrict (toLazyByteString fullRequest)
 
--- | Unsigned varint size (for computing prefix size).
 uvarSize :: Int -> Int
 uvarSize n
   | n < 0x80       = 1

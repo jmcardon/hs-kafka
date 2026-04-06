@@ -22,7 +22,7 @@ import Kafka.Internal.Fetch.Request
 import Kafka.Internal.JoinGroup.Request
 import Kafka.Internal.ListOffsets.Request
 import Kafka.Internal.Murmur2 (murmur2)
-import Kafka.Internal.Produce.Request (buildProduceRequest)
+import Kafka.Internal.Produce.Request (ProduceRequestParams(..), buildProduceRequest)
 import Kafka.Internal.RecordBatch (RecordInput(..))
 import Kafka.Internal.Produce.Response
 import Kafka.Internal.Wire (Wire, runWire)
@@ -84,6 +84,15 @@ buildBS = BL.toStrict . toLazyByteString
 -- | Wrap a ByteString as a value-only RecordInput (no key, no headers).
 ri :: B.ByteString -> RecordInput
 ri v = RecordInput Nothing (Just v) [] 0
+
+-- | Default produce request params for tests.
+testParams :: Int32 -> Int16 -> B.ByteString -> TopicName -> ProduceRequestParams
+testParams corrId acks cid topic = ProduceRequestParams
+  { prpCorrId = corrId, prpAcks = acks, prpClientId = cid
+  , prpTimeoutMs = 30000, prpTopic = topic, prpPartition = 0
+  , prpProducerId = -1, prpProducerEpoch = -1, prpBaseSequence = -1
+  , prpCompression = NoCompression, prpFirstTs = 0
+  }
 
 -- | Parse a Wire parser on BuildR output.
 wireParse :: Wire a -> BuildR -> Maybe a
@@ -287,21 +296,23 @@ murmur2Tests = testGroup "Murmur2 (Java Kafka compatible)"
 idempotentProduceTests :: TestTree
 idempotentProduceTests = testGroup "Idempotent produce"
   [ testCase "idempotent request encodes PID in record batch" $ do
-      let req = buildProduceRequest 0 (-1) "kafka-native" 30000
-                  "test-topic" 0 42 1 0 NoCompression 0 [ri "test message"]
+      let req = buildProduceRequest (testParams 0 (-1) "kafka-native" "test-topic")
+                  { prpProducerId = 42, prpProducerEpoch = 1, prpBaseSequence = 0 }
+                  [ri "test message"]
       assertBool "request should be non-empty" (B.length req > 0)
-      let nonIdem = buildProduceRequest 0 (-1) "kafka-native" 30000
-                      "test-topic" 0 (-1) (-1) (-1) NoCompression 0 [ri "test message"]
+      let nonIdem = buildProduceRequest (testParams 0 (-1) "kafka-native" "test-topic")
+                      [ri "test message"]
       assertBool "idempotent request should differ from non-idempotent"
         (req /= nonIdem)
   , testCase "NoCompression is deterministic" $ do
-      let r1 = buildProduceRequest 0 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0 [ri "test"]
-          r2 = buildProduceRequest 0 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0 [ri "test"]
+      let p = testParams 0 1 "ruko" "test"
+          r1 = buildProduceRequest p [ri "test"]
+          r2 = buildProduceRequest p [ri "test"]
       r1 @?= r2
   , testCase "Gzip compression produces different (shorter) bytes" $ do
       let payload = B.concat (replicate 50 "repetitive data for compression ")
-          compressed = buildProduceRequest 0 1 "test" 30000 "test" 0 (-1) (-1) (-1) Gzip 0 [ri payload]
-          plain = buildProduceRequest 0 1 "test" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0 [ri payload]
+          compressed = buildProduceRequest (testParams 0 1 "test" "test") { prpCompression = Gzip } [ri payload]
+          plain = buildProduceRequest (testParams 0 1 "test" "test") [ri payload]
       assertBool "compressed should differ" (compressed /= plain)
       assertBool "compressed should be shorter" (B.length compressed < B.length plain)
   ]
@@ -361,17 +372,13 @@ goldenTests = testGroup "Golden tests"
 -- Produce golden tests use buildProduceRequest with corrId=0xbeef (legacy default).
 produceTest :: IO BL.ByteString
 produceTest = pure $ BL.fromStrict $ buildProduceRequest
-  0xbeef 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0
+  (testParams 0xbeef 1 "ruko" "test")
   [ri "\"im not owned! im not owned!!\", i continue to insist as i slowlyshrink and transform into a corn cob"]
 
 multipleProduceTest :: IO BL.ByteString
 multipleProduceTest = pure $ BL.fromStrict $ buildProduceRequest
-  0xbeef 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0
-  [ ri "i'm dying"
-  , ri "is it blissful?"
-  , ri "it's like a dream"
-  , ri "i want to dream"
-  ]
+  (testParams 0xbeef 1 "ruko" "test")
+  [ri "i'm dying", ri "is it blissful?", ri "it's like a dream", ri "i want to dream"]
 
 fetchTest :: IO BL.ByteString
 fetchTest = pure (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0] 30000000)

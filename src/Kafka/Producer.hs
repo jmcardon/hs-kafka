@@ -44,6 +44,7 @@ module Kafka.Producer
 
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar, readMVar)
 import Control.Monad (void, forM_)
+import Data.Foldable (traverse_)
 import GHC.Clock (getMonotonicTimeNSec)
 import Control.Concurrent.STM
 import Data.Int (Int32, Int64, Int16)
@@ -330,14 +331,8 @@ drainWithTimeout q timeoutMs = do
 -- | Invoke per-message callback + global callback, return the report.
 invokeCallbacks :: Maybe (DeliveryReport -> IO ()) -> DeliveryEntry -> IO DeliveryReport
 invokeCallbacks globalCb (DeliveryEntry dr mCb) = do
-  -- Per-message callback first
-  case mCb of
-    Just cb -> cb dr
-    Nothing -> pure ()
-  -- Global callback
-  case globalCb of
-    Just cb -> cb dr
-    Nothing -> pure ()
+  traverse_ ($ dr) mCb
+  traverse_ ($ dr) globalCb
   pure dr
 
 ------------------------------------------------------------------------
@@ -399,11 +394,12 @@ stickyPartition producer topic _count = do
 rotatePartitions :: KafkaProducer -> IO ()
 rotatePartitions producer = do
   counters <- readMVar (kpCounters producer)
-  forM_ (Map.toList counters) $ \(topic, ref) -> do
-    mCount <- partitionCountFor (kpClient producer) topic
-    case mCount of
-      Nothing -> pure ()
-      Just count ->
+  void $ Map.traverseWithKey rotateOne counters
+  where
+    rotateOne topic ref = do
+      mCount <- partitionCountFor (kpClient producer) topic
+      traverse_ (\count ->
         atomicModifyIORef' ref $ \n ->
           let n' = if n + 1 >= fromIntegral count then 0 else n + 1
           in (n', ())
+        ) mCount

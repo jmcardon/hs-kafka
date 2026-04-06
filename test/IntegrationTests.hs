@@ -26,6 +26,7 @@ main = defaultMain $ testGroup "Integration"
   [ mockClusterTests
   , clientTests
   , producerTests
+  , recordFeatureTests
   , compressionTests
   , errorHandlingTests
   , reconnectionTests
@@ -207,6 +208,81 @@ producerTests = testGroup "Producer"
           reports <- pollEvents producer 5000
           let failures = filter isDeliveryFailureReport reports
           assertEqual "all 1000 should succeed" 0 (length failures)
+  ]
+
+------------------------------------------------------------------------
+-- Record features tests (headers, keys, partitions, offsets)
+------------------------------------------------------------------------
+
+recordFeatureTests :: TestTree
+recordFeatureTests = testGroup "Record features"
+  [ testCase "produce with key routes deterministically" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "key-test" 4 1
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          -- Same key → same partition
+          let rec k = ProducerRecord "key-test" UnassignedPartition
+                        (Just k) (Just "value") []
+          r1 <- produce producer (rec "my-key")
+          r2 <- produce producer (rec "my-key")
+          r3 <- produce producer (rec "other-key")
+          case (r1, r2) of
+            (Right (DeliverySuccess _ _), Right (DeliverySuccess _ _)) -> pure ()
+            _ -> assertFailure "keyed produce should succeed"
+          case r3 of
+            Right (DeliverySuccess _ _) -> pure ()
+            _ -> assertFailure "keyed produce should succeed"
+
+  , testCase "produce with explicit partition" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "part-test" 4 1
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          let rec p = ProducerRecord "part-test" (SpecifiedPartition p)
+                        Nothing (Just "value") []
+          r0 <- produce producer (rec 0)
+          r2 <- produce producer (rec 2)
+          case (r0, r2) of
+            (Right (DeliverySuccess _ _), Right (DeliverySuccess _ _)) -> pure ()
+            _ -> assertFailure "explicit partition produce should succeed"
+
+  , testCase "produce with headers" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "header-test" 1 1
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          let rec = ProducerRecord "header-test" UnassignedPartition
+                      Nothing (Just "payload")
+                      [ Header "trace-id" (Just "abc123")
+                      , Header "content-type" (Just "text/plain")
+                      , Header "empty-header" Nothing
+                      ]
+          result <- produce producer rec
+          case result of
+            Left err -> assertFailure ("produce with headers failed: " ++ show err)
+            Right (DeliverySuccess _ _) -> pure ()
+            Right (DeliveryFailure _ e) -> assertFailure ("delivery failed: " ++ show e)
+
+  , testCase "delivery report contains offset" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "offset-test" 1 1
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          r1 <- produce producer (mkRecord "offset-test" "msg1")
+          r2 <- produce producer (mkRecord "offset-test" "msg2")
+          case (r1, r2) of
+            (Right (DeliverySuccess _ (Offset o1)), Right (DeliverySuccess _ (Offset o2))) -> do
+              assertBool "second offset should be >= first" (o2 >= o1)
+            _ -> assertFailure "both produces should succeed with offsets"
+
+  , testCase "produce with null value" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "null-test" 1 1
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          let rec = ProducerRecord "null-test" UnassignedPartition
+                      (Just "key") Nothing []  -- null value (tombstone)
+          result <- produce producer rec
+          case result of
+            Left err -> assertFailure ("null value produce failed: " ++ show err)
+            Right (DeliverySuccess _ _) -> pure ()
+            Right (DeliveryFailure _ e) -> assertFailure ("delivery failed: " ++ show e)
   ]
 
 ------------------------------------------------------------------------

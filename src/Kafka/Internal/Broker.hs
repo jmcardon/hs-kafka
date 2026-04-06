@@ -43,6 +43,7 @@ import Control.Concurrent.MVar (MVar, modifyMVar)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, IOException, try)
 import Control.Monad (unless, void, forM_)
+import Data.Foldable (traverse_)
 import Data.List (partition)
 import Data.Bits (shiftR)
 import Data.IntMap.Strict (IntMap)
@@ -66,7 +67,7 @@ import Kafka.Internal.ApiVersions.Request (apiVersionsRequest)
 import Kafka.Internal.ApiVersions.Response (ApiVersionsResponse(..), ApiVersionEntry(..),
   parseApiVersionsResponse)
 import Kafka.Internal.Config
-import Kafka.Internal.Produce.Request (buildProduceRequest)
+import Kafka.Internal.Produce.Request (ProduceRequestParams(..), buildProduceRequest)
 import Kafka.Internal.RecordBatch (RecordInput(..))
 import Kafka.Internal.Produce.Response (ProduceResponse(..), ProduceResponseMessage(..),
   ProducePartitionResponse(..), parseProduceResponseV9)
@@ -448,15 +449,19 @@ sendPartitionBatch env kafka ((topic, part), msgsRev) = do
   -- Get corrId and build the entire request as a strict ByteString
   corrId <- nextCorrId (beCorrCounter env)
   let !recordInputs = map toRecordInput msgs
-      !reqBytes = buildProduceRequest
-        corrId
-        (acksToInt16 (ccAcks cfg))
-        (ccClientId cfg)
-        (ccRequestTimeoutMs cfg)
-        topic part pid epoch baseSeq
-        (ccCompression cfg)
-        0  -- firstTimestamp (0 = broker-assigned)
-        recordInputs
+      !reqBytes = buildProduceRequest ProduceRequestParams
+        { prpCorrId = corrId
+        , prpAcks = acksToInt16 (ccAcks cfg)
+        , prpClientId = ccClientId cfg
+        , prpTimeoutMs = ccRequestTimeoutMs cfg
+        , prpTopic = topic
+        , prpPartition = part
+        , prpProducerId = pid
+        , prpProducerEpoch = epoch
+        , prpBaseSequence = baseSeq
+        , prpCompression = ccCompression cfg
+        , prpFirstTs = 0
+        } recordInputs
 
   let callbacks = [(part, msgs)]
   atomically $ modifyTVar' (beInflight env) $
@@ -588,11 +593,7 @@ dispatchProduceResponse env topic callbacks prodResp = do
     -- Push delivery entry to queue + fill sync TMVar. No user callbacks.
     deliverReport :: PendingMessage -> DeliveryReport -> IO ()
     deliverReport m dr = atomically $ do
-      -- Fill sync TMVar if present (for sync produce)
-      case pmSyncVar m of
-        Just var -> void $ tryPutTMVar var dr
-        Nothing  -> pure ()
-      -- Push to delivery queue (for pollEvents)
+      traverse_ (\var -> void $ tryPutTMVar var dr) (pmSyncVar m)
       let !entry = DeliveryEntry dr (pmCallback m)
       full <- isFullTBQueue (pmDeliveryQueue m)
       unless full $ writeTBQueue (pmDeliveryQueue m) entry
@@ -631,9 +632,7 @@ toRecordInput pm = RecordInput
 
 deliverReportIO :: PendingMessage -> DeliveryReport -> IO ()
 deliverReportIO m dr = atomically $ do
-  case pmSyncVar m of
-    Just var -> void $ tryPutTMVar var dr
-    Nothing  -> pure ()
+  traverse_ (\var -> void $ tryPutTMVar var dr) (pmSyncVar m)
   let !entry = DeliveryEntry dr (pmCallback m)
   full <- isFullTBQueue (pmDeliveryQueue m)
   unless full $ writeTBQueue (pmDeliveryQueue m) entry
@@ -643,14 +642,12 @@ deliverReportIO m dr = atomically $ do
 ------------------------------------------------------------------------
 
 invokeLogCallback :: BrokerEnv -> LogLevel -> String -> IO ()
-invokeLogCallback env level msg = case ccLogCallback (beConfig env) of
-  Just cb -> cb level msg
-  Nothing -> pure ()
+invokeLogCallback env level msg =
+  traverse_ (\cb -> cb level msg) (ccLogCallback (beConfig env))
 
 invokeErrorCallback :: BrokerEnv -> String -> IO ()
-invokeErrorCallback env msg = case ccErrorCallback (beConfig env) of
-  Just cb -> cb msg
-  Nothing -> pure ()
+invokeErrorCallback env msg =
+  traverse_ ($ msg) (ccErrorCallback (beConfig env))
 
 ------------------------------------------------------------------------
 -- Correlation ID
