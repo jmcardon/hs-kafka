@@ -1,68 +1,45 @@
 # kafka-native TODO
 
 ## Completed
-- [x] Produce path performance (3-4x faster than librdkafka)
 - [x] Wire parser (4-7x faster than bytesmith)
-- [x] Key/value/header encoding in record batch
-- [x] Murmur2 partitioner (Java Kafka compatible)
-- [x] Timestamps in record batches
-- [x] ProducerRecord + DeliveryReport + pollEvents API
-- [x] Callbacks in poller thread (not broker thread)
+- [x] Single-alloc RecordBatch (3-4x faster than librdkafka)
+- [x] Key/value/header encoding, murmur2 partitioner, timestamps
+- [x] ProducerRecord + DeliveryReport + pollEvents
+- [x] Callbacks in poller thread
 - [x] Queue forwarding
-- [x] Dynamic broker discovery from metadata
-- [x] Periodic metadata refresh timer
-- [x] Log/error/stats callback config types
-- [x] message.timeout.ms config
+- [x] Dynamic broker discovery + periodic metadata refresh
+- [x] Log/error/stats callback config + invocation on connect/disconnect
+- [x] message.timeout.ms config + enforcement in flushBatch
+- [x] Priority ops (separate control channel for flush/shutdown)
+- [x] Sticky partitioner (keyless → same partition per batch)
+- [x] Fetch v12 request/response (flexible encoding)
+- [x] New consumer scaffold (Consumer.New with KafkaClient)
 
 ## High Priority
 
-### Consumer rewrite using KafkaClient
-The biggest remaining gap. Current Consumer uses direct socket access.
-Needs: KafkaClient broker threads, Wire parser, fetch/commit/rebalance.
+### Request assembly optimization
+buildProduceRequest assembles via BSL concatenation + BSL.toStrict (copy).
+Should pre-compute total size and write into single pinned buffer.
+The record batch (99% of bytes) is already optimal — this is the ~40 byte
+header that's assembled suboptimally.
 
-### Callback invocation points
-Log/error/stats callbacks are configured but not invoked anywhere yet.
-Wire up: broker connect/disconnect → error callback, metadata refresh → log,
-queue stats → stats callback.
+### Consumer integration tests
+Consumer.New compiles but needs integration tests: subscribe, fetch,
+commit, rebalance, multi-partition, auto-commit.
 
-### message.timeout.ms enforcement
-Config exists but messages don't actually expire in the batch queue.
-Need: check message age in senderLoop, fail expired messages.
+### Consumer auto-commit timer
+ccAutoCommitMs is configured but no timer thread yet.
 
 ## Medium Priority
 
-### SASL/SSL
-No authentication. Need TLS via Haskell `tls` package, SASL-PLAIN/SCRAM.
-
-### Fetch v12 (flexible encoding)
-Current Fetch at v10. Upgrade for compact encoding + tagged fields.
-
-### Priority ops
-Control messages (shutdown, flush) should jump ahead of produce ops.
-TBQueue is FIFO — need priority queue or separate control channel.
-
-### Sticky partitioner
-librdkafka's default since 2.4. Sticky to one partition per batch
-for better batching efficiency. Currently round-robin.
-
-### High-performance queue investigation
-Research faster alternatives to TBQueue for the delivery report path.
-Need to support 100k+ msg/sec without backpressure. Consider:
-- Unagi-chan
-- Lock-free ring buffers
-- Batched queue (push [DeliveryEntry] instead of one-at-a-time)
+### SASL/SSL authentication
+### Transactional producer (state machine)
+### Admin APIs (CreateTopics, etc.)
+### Topic-level config overrides
 
 ## Low Priority
 
-### Transactional producer
-InitProducerId API exists. Need full txn state machine.
-
-### Admin APIs
-CreateTopics, DeleteTopics, etc.
-
-### Topic-level config
-Per-topic overrides for compression, acks, etc.
-
-### Remove dead code
-Combinator.hs, Zigzag.hs, ShowDebug.hs — all replaceable/dead.
-bytesmith/byteslice — remove from library deps.
+### High-performance queue investigation
+TBQueue vs unagi-chan vs ring buffer for 100k+ msg/sec.
+### Remove dead code (Combinator.hs, old Consumer.hs, Zigzag.hs)
+### Remove bytesmith/byteslice from library deps

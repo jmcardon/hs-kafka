@@ -71,9 +71,29 @@ buildProduceRequest !corrId !acksVal !cid !timeout !topic !partition
 
     !suffixBuilder = taggedFields <> taggedFields <> taggedFields
 
-    !prefixBytes = toLazyByteString prefixBuilder
-    !suffixBytes = toLazyByteString suffixBuilder
-    !fullBody = prefixBytes <> BSL.fromStrict batchBS <> suffixBytes
-    !bodySize = fromIntegral (BSL.length fullBody) :: Int32
+    -- Compute body size arithmetically (no materialization needed)
+    TopicName !tn = topic
+    !topicLen = BS.length tn
+    !prefixSize = 24 + BS.length cid
+                + uvarSize (topicLen + 1) + topicLen
+                + uvarSize (batchLen + 1)
+    !suffixSize = 3  -- three taggedFields (0x00 each)
+    !bodySize = fromIntegral (prefixSize + batchLen + suffixSize) :: Int32
 
-  in BSL.toStrict (toLazyByteString (int32 bodySize) <> fullBody)
+    -- Build entire request as a single BuildR, materialize once
+    !fullRequest = int32 bodySize
+                <> prefixBuilder
+                <> bs batchBS
+                <> suffixBuilder
+
+  in BSL.toStrict (toLazyByteString fullRequest)
+
+-- | Unsigned varint size (for computing prefix size).
+uvarSize :: Int -> Int
+uvarSize n
+  | n < 0x80       = 1
+  | n < 0x4000     = 2
+  | n < 0x200000   = 3
+  | n < 0x10000000 = 4
+  | otherwise       = 5
+{-# INLINE uvarSize #-}
