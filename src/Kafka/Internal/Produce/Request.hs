@@ -1,14 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | Produce v9 request encoding.
---
--- The entire request is built as a single strict ByteString:
---   1. Record batch built via RecordBatch (single pinned allocation)
---   2. Protocol header written via Writer (BuildR, ~40 bytes)
---   3. Assembled: size prefix + header + batch + tagged fields
---
--- Correlation ID is baked in from the start — no post-hoc patching.
 module Kafka.Internal.Produce.Request
   ( buildProduceRequest
   ) where
@@ -21,7 +13,7 @@ import Data.Int (Int16, Int32, Int64)
 import Kafka.Common (TopicName(..))
 import Kafka.Internal.Compression (compressBatch)
 import Kafka.Internal.Config (Compression(..))
-import Kafka.Internal.RecordBatch (buildRecordBatch, buildRecords, wrapRecordBatch)
+import Kafka.Internal.RecordBatch (RecordInput(..), buildRecordBatch, buildRecords, wrapRecordBatch)
 import Kafka.Internal.Writer
 
 produceApiVersion :: Int16
@@ -30,42 +22,38 @@ produceApiVersion = 9
 produceApiKey :: Int16
 produceApiKey = 0
 
--- | Build a complete Produce v9 request as a strict ByteString.
---
--- Correlation ID is baked in — no patching needed. The caller provides
--- the corrId to use. Returns a strict ByteString ready for sendAll.
+-- | Build a Produce v9 request as a strict ByteString.
 buildProduceRequest ::
-     Int32           -- ^ correlation ID (baked in, not patched)
+     Int32           -- ^ correlation ID
   -> Int16           -- ^ acks
   -> ByteString      -- ^ client ID
   -> Int             -- ^ timeout (ms)
   -> TopicName
   -> Int32           -- ^ partition
-  -> Int64           -- ^ producerId (-1 for non-idempotent)
-  -> Int16           -- ^ producerEpoch (-1 for non-idempotent)
-  -> Int32           -- ^ baseSequence (-1 for non-idempotent)
+  -> Int64           -- ^ producerId
+  -> Int16           -- ^ producerEpoch
+  -> Int32           -- ^ baseSequence
   -> Compression
-  -> [ByteString]    -- ^ message payloads
+  -> Int64           -- ^ firstTimestamp (epoch ms, 0 for broker-assigned)
+  -> [RecordInput]   -- ^ records (key, value, headers, timestamp delta)
   -> ByteString
 buildProduceRequest !corrId !acksVal !cid !timeout !topic !partition
-    !producerId !producerEpoch !baseSeq !compression payloads =
+    !producerId !producerEpoch !baseSeq !compression !firstTs records =
   let
-    !n = length payloads
+    !n = length records
 
-    -- Build the record batch
     !batchBS = case compression of
       NoCompression ->
-        buildRecordBatch producerId producerEpoch baseSeq 0 payloads
+        buildRecordBatch producerId producerEpoch baseSeq 0 firstTs records
       _ ->
-        let !rawRecords = buildRecords payloads
+        let !rawRecords = buildRecords records
             (!compRecords, !attr) = compressBatch compression rawRecords
         in if attr == 0
-          then buildRecordBatch producerId producerEpoch baseSeq 0 payloads
-          else wrapRecordBatch producerId producerEpoch baseSeq attr n compRecords
+          then buildRecordBatch producerId producerEpoch baseSeq 0 firstTs records
+          else wrapRecordBatch producerId producerEpoch baseSeq attr n firstTs compRecords
 
     !batchLen = BS.length batchBS
 
-    -- Protocol prefix with corrId baked in
     !prefixBuilder =
       int16 produceApiKey
       <> int16 produceApiVersion
@@ -88,5 +76,4 @@ buildProduceRequest !corrId !acksVal !cid !timeout !topic !partition
     !fullBody = prefixBytes <> BSL.fromStrict batchBS <> suffixBytes
     !bodySize = fromIntegral (BSL.length fullBody) :: Int32
 
-    -- Final: size prefix + body, materialized as strict ByteString
   in BSL.toStrict (toLazyByteString (int32 bodySize) <> fullBody)

@@ -4,11 +4,12 @@
 --
 -- Writes the entire record batch (61-byte header + all records) into a
 -- pinned buffer. The result IS a ByteString — one allocation total.
--- CRC32C computed directly on the Ptr via FFI (no ByteString wrapper).
+-- CRC32C computed directly on the Ptr via FFI.
 --
--- All inputs and outputs are ByteString. No ByteArray in the hot path.
+-- Supports full record format v2: key, value, headers, timestamp deltas.
 module Kafka.Internal.RecordBatch
-  ( buildRecordBatch
+  ( RecordInput(..)
+  , buildRecordBatch
   , buildRecords
   , wrapRecordBatch
   ) where
@@ -27,44 +28,59 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import Foreign.Marshal.Utils (copyBytes)
 
+import Kafka.Producer.Types (Header(..))
+
+------------------------------------------------------------------------
+-- Input type
+------------------------------------------------------------------------
+
+-- | A single record to be written into the batch.
+data RecordInput = RecordInput
+  { riKey     :: !(Maybe ByteString)
+  , riValue   :: !(Maybe ByteString)
+  , riHeaders :: ![Header]
+  , riTimestampDelta :: {-# UNPACK #-} !Int64
+    -- ^ Milliseconds relative to the batch's firstTimestamp.
+    -- 0 if the batch uses broker-assigned timestamps.
+  }
+
 ------------------------------------------------------------------------
 -- Public API
 ------------------------------------------------------------------------
 
 -- | Build a complete record batch (header + records) as a ByteString.
--- Single pinned allocation.
 buildRecordBatch ::
      Int64 -> Int16 -> Int32 -> Int16
-  -> [ByteString]  -- ^ message payloads
+  -> Int64           -- ^ firstTimestamp (epoch ms, 0 for broker-assigned)
+  -> [RecordInput]
   -> ByteString
-buildRecordBatch !pid !epoch !baseSeq !comprAttr payloads =
-  let !(# recordsSize, payloadCount #) = computeRecordsSizeAndCount payloads
+buildRecordBatch !pid !epoch !baseSeq !comprAttr !firstTs records =
+  let !(# recordsSize, recordCount #) = computeRecordsSizeAndCount records
       !totalSize = 61 + recordsSize
   in unsafeCreate totalSize $ \ptr -> do
-    writeAllRecords (ptr `plusPtr` 61) payloads 0
-    writePostCrc ptr pid epoch baseSeq comprAttr payloadCount
+    writeAllRecords (ptr `plusPtr` 61) records 0
+    writePostCrc ptr pid epoch baseSeq comprAttr firstTs recordCount
     let !crc = crc32cPtr (ptr `plusPtr` 21) (40 + recordsSize)
     writePreCrc ptr recordsSize crc
 {-# INLINE buildRecordBatch #-}
 
--- | Build just the records portion (no header).
--- Used for compression: build records → compress → wrapRecordBatch.
-buildRecords :: [ByteString] -> ByteString
-buildRecords payloads =
-  let !(# size, _ #) = computeRecordsSizeAndCount payloads
-  in unsafeCreate size $ \ptr -> writeAllRecords ptr payloads 0
+-- | Build just the records portion (no header). For compression.
+buildRecords :: [RecordInput] -> ByteString
+buildRecords records =
+  let !(# size, _ #) = computeRecordsSizeAndCount records
+  in unsafeCreate size $ \ptr -> writeAllRecords ptr records 0
 
 -- | Wrap compressed records with the 61-byte batch header.
 wrapRecordBatch ::
      Int64 -> Int16 -> Int32 -> Int16 -> Int
-  -> ByteString -> ByteString
-wrapRecordBatch !pid !epoch !baseSeq !comprAttr !recordCount records =
+  -> Int64 -> ByteString -> ByteString
+wrapRecordBatch !pid !epoch !baseSeq !comprAttr !recordCount !firstTs records =
   let !recordsSize = BS.length records
       !totalSize = 61 + recordsSize
   in unsafeCreate totalSize $ \ptr -> do
     BSU.unsafeUseAsCStringLen records $ \(srcPtr, len) ->
       copyBytes (ptr `plusPtr` 61) (castPtr srcPtr) len
-    writePostCrc ptr pid epoch baseSeq comprAttr recordCount
+    writePostCrc ptr pid epoch baseSeq comprAttr firstTs recordCount
     let !crc = crc32cPtr (ptr `plusPtr` 21) (40 + recordsSize)
     writePreCrc ptr recordsSize crc
 
@@ -87,13 +103,13 @@ writePreCrc !p !recordsSize !crc = do
 -- Header: postCrc (40 bytes at offset 21)
 ------------------------------------------------------------------------
 
-writePostCrc :: Ptr Word8 -> Int64 -> Int16 -> Int32 -> Int16 -> Int -> IO ()
-writePostCrc !base !pid !epoch !baseSeq !comprAttr !recordCount = do
+writePostCrc :: Ptr Word8 -> Int64 -> Int16 -> Int32 -> Int16 -> Int64 -> Int -> IO ()
+writePostCrc !base !pid !epoch !baseSeq !comprAttr !firstTs !recordCount = do
   let !p = base `plusPtr` 21
   poke16BE p comprAttr
   poke32BE (p `plusPtr` 2) (fromIntegral (recordCount - 1))
-  poke64BE (p `plusPtr` 6) 0
-  poke64BE (p `plusPtr` 14) 0
+  poke64BE (p `plusPtr` 6) firstTs                -- firstTimestamp
+  poke64BE (p `plusPtr` 14) firstTs               -- maxTimestamp (= firstTs for now)
   poke64BE (p `plusPtr` 22) pid
   poke16BE (p `plusPtr` 30) epoch
   poke32BE (p `plusPtr` 32) baseSeq
@@ -104,45 +120,119 @@ writePostCrc !base !pid !epoch !baseSeq !comprAttr !recordCount = do
 -- Records
 ------------------------------------------------------------------------
 
-writeAllRecords :: Ptr Word8 -> [ByteString] -> Int -> IO ()
+writeAllRecords :: Ptr Word8 -> [RecordInput] -> Int -> IO ()
 writeAllRecords !_ [] !_ = pure ()
-writeAllRecords !p (payload : rest) !i = do
-  p' <- writeRecord p i payload
+writeAllRecords !p (r : rest) !i = do
+  p' <- writeRecord p i r
   writeAllRecords p' rest (i + 1)
 {-# INLINE writeAllRecords #-}
 
-writeRecord :: Ptr Word8 -> Int -> ByteString -> IO (Ptr Word8)
-writeRecord !p !index !payload = do
-  let !payloadLen = BS.length payload
-      !bodySize = 1 + 1 + zigzagSize index + 1 + zigzagSize payloadLen + payloadLen + 1
-  p1 <- pokeZigzag p bodySize          -- record length
-  poke p1 (0 :: Word8)                 -- attributes
-  poke (p1 `plusPtr` 1) (0 :: Word8)   -- timestampDelta (zigzag 0)
-  p2 <- pokeZigzag (p1 `plusPtr` 2) index  -- offsetDelta
-  poke p2 (1 :: Word8)                 -- keyLength (zigzag -1)
-  p3 <- pokeZigzag (p2 `plusPtr` 1) payloadLen  -- valueLength
-  -- Copy payload bytes: use unsafeUseAsCStringLen to get Ptr, then memcpy
-  BSU.unsafeUseAsCStringLen payload $ \(srcPtr, len) ->
-    copyBytes p3 (castPtr srcPtr) len
-  let !p4 = p3 `plusPtr` payloadLen
-  poke p4 (0 :: Word8)                 -- headerCount (zigzag 0)
-  pure (p4 `plusPtr` 1)
+writeRecord :: Ptr Word8 -> Int -> RecordInput -> IO (Ptr Word8)
+writeRecord !p !index (RecordInput mKey mValue hdrs tsDelta) = do
+  let !keyLen = maybe (-1) BS.length mKey
+      !valLen = maybe (-1) BS.length mValue
+      !hdrsSize = headersWireSize hdrs
+      !bodySize = 1                             -- attributes
+               + zigzagSize (fromIntegral tsDelta) -- timestampDelta
+               + zigzagSize index               -- offsetDelta
+               + zigzagSize keyLen              -- keyLength
+               + (if keyLen >= 0 then keyLen else 0) -- key bytes
+               + zigzagSize valLen              -- valueLength
+               + (if valLen >= 0 then valLen else 0) -- value bytes
+               + hdrsSize                       -- headers (count varint + each header)
+  -- Record length
+  p1 <- pokeZigzag p bodySize
+  -- Attributes (always 0 for individual records in v2)
+  poke p1 (0 :: Word8)
+  -- Timestamp delta
+  p2 <- pokeZigzag (p1 `plusPtr` 1) (fromIntegral tsDelta)
+  -- Offset delta
+  p3 <- pokeZigzag p2 index
+  -- Key
+  p4 <- pokeZigzag p3 keyLen
+  p5 <- pokeOptionalBytes p4 mKey
+  -- Value
+  p6 <- pokeZigzag p5 valLen
+  p7 <- pokeOptionalBytes p6 mValue
+  -- Headers
+  p8 <- pokeHeaders p7 hdrs
+  pure p8
 {-# INLINE writeRecord #-}
 
+-- | Write optional bytes (Nothing = no bytes written, Just = write content).
+pokeOptionalBytes :: Ptr Word8 -> Maybe ByteString -> IO (Ptr Word8)
+pokeOptionalBytes !p Nothing = pure p
+pokeOptionalBytes !p (Just bs) =
+  BSU.unsafeUseAsCStringLen bs $ \(srcPtr, len) -> do
+    copyBytes p (castPtr srcPtr) len
+    pure (p `plusPtr` len)
+{-# INLINE pokeOptionalBytes #-}
+
+-- | Write record headers: varint(count) then each header.
+pokeHeaders :: Ptr Word8 -> [Header] -> IO (Ptr Word8)
+pokeHeaders !p [] = do
+  poke p (0 :: Word8)  -- headerCount = 0 (zigzag 0)
+  pure (p `plusPtr` 1)
+pokeHeaders !p hdrs = do
+  p1 <- pokeZigzag p (length hdrs)
+  foldlM' pokeHeader p1 hdrs
+{-# INLINE pokeHeaders #-}
+
+pokeHeader :: Ptr Word8 -> Header -> IO (Ptr Word8)
+pokeHeader !p (Header key mVal) = do
+  let !keyLen = BS.length key
+      !valLen = maybe (-1) BS.length mVal
+  p1 <- pokeZigzag p keyLen
+  p2 <- BSU.unsafeUseAsCStringLen key $ \(srcPtr, len) -> do
+    copyBytes p1 (castPtr srcPtr) len
+    pure (p1 `plusPtr` len)
+  p3 <- pokeZigzag p2 valLen
+  pokeOptionalBytes p3 mVal
+{-# INLINE pokeHeader #-}
+
+-- Strict left fold over a list with monadic accumulator.
+foldlM' :: (a -> b -> IO a) -> a -> [b] -> IO a
+foldlM' _ !acc [] = pure acc
+foldlM' f !acc (x:xs) = do
+  !acc' <- f acc x
+  foldlM' f acc' xs
+{-# INLINE foldlM' #-}
+
 ------------------------------------------------------------------------
--- Size computation (pure, no allocations)
+-- Size computation
 ------------------------------------------------------------------------
 
--- | Returns (# totalRecordsSize, payloadCount #) in a single pass.
-computeRecordsSizeAndCount :: [ByteString] -> (# Int, Int #)
+computeRecordsSizeAndCount :: [RecordInput] -> (# Int, Int #)
 computeRecordsSizeAndCount = go 0 0
   where
     go !acc !i [] = (# acc, i #)
-    go !acc !i (payload : rest) =
-      let !payloadLen = BS.length payload
-          !bodySize = 1 + 1 + zigzagSize i + 1 + zigzagSize payloadLen + payloadLen + 1
+    go !acc !i (RecordInput mKey mValue hdrs tsDelta : rest) =
+      let !keyLen = maybe (-1) BS.length mKey
+          !valLen = maybe (-1) BS.length mValue
+          !hdrsSize = headersWireSize hdrs
+          !bodySize = 1
+                   + zigzagSize (fromIntegral tsDelta)
+                   + zigzagSize i
+                   + zigzagSize keyLen
+                   + max 0 keyLen
+                   + zigzagSize valLen
+                   + max 0 valLen
+                   + hdrsSize
       in go (acc + zigzagSize bodySize + bodySize) (i + 1) rest
 {-# INLINE computeRecordsSizeAndCount #-}
+
+-- | Wire size of the headers section: varint(count) + sum of each header.
+headersWireSize :: [Header] -> Int
+headersWireSize [] = 1  -- zigzag(0) = 1 byte
+headersWireSize hdrs = zigzagSize (length hdrs) + sum (map headerWireSize hdrs)
+{-# INLINE headersWireSize #-}
+
+headerWireSize :: Header -> Int
+headerWireSize (Header key mVal) =
+  let !keyLen = BS.length key
+      !valLen = maybe (-1) BS.length mVal
+  in zigzagSize keyLen + keyLen + zigzagSize valLen + max 0 valLen
+{-# INLINE headerWireSize #-}
 
 ------------------------------------------------------------------------
 -- Zigzag varint
@@ -182,7 +272,7 @@ uvarintSize n
 {-# INLINE uvarintSize #-}
 
 ------------------------------------------------------------------------
--- Big-endian poke: single store + BSWAP
+-- Big-endian poke
 ------------------------------------------------------------------------
 
 poke16BE :: Ptr Word8 -> Int16 -> IO ()
@@ -198,7 +288,7 @@ poke64BE p v = poke (castPtr p :: Ptr Word64) (byteSwap64 (fromIntegral v))
 {-# INLINE poke64BE #-}
 
 ------------------------------------------------------------------------
--- CRC32C — direct FFI on Ptr
+-- CRC32C
 ------------------------------------------------------------------------
 
 foreign import ccall unsafe "crc32c/crc32c.h crc32c_extend"

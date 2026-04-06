@@ -65,6 +65,7 @@ import Kafka.Internal.ApiVersions.Response (ApiVersionsResponse(..), ApiVersionE
   parseApiVersionsResponse)
 import Kafka.Internal.Config
 import Kafka.Internal.Produce.Request (buildProduceRequest)
+import Kafka.Internal.RecordBatch (RecordInput(..))
 import Kafka.Internal.Produce.Response (ProduceResponse(..), ProduceResponseMessage(..),
   ProducePartitionResponse(..), parseProduceResponseV9)
 import Kafka.Internal.Reconnect
@@ -416,14 +417,16 @@ sendPartitionBatch env kafka ((topic, part), msgsRev) = do
 
   -- Get corrId and build the entire request as a strict ByteString
   corrId <- nextCorrId (beCorrCounter env)
-  let !reqBytes = buildProduceRequest
+  let !recordInputs = map toRecordInput msgs
+      !reqBytes = buildProduceRequest
         corrId
         (acksToInt16 (ccAcks cfg))
         (ccClientId cfg)
         (ccRequestTimeoutMs cfg)
         topic part pid epoch baseSeq
         (ccCompression cfg)
-        (map pmPayload msgs)
+        0  -- firstTimestamp (0 = broker-assigned)
+        recordInputs
 
   let callbacks = [(part, msgs)]
   atomically $ modifyTVar' (beInflight env) $
@@ -586,6 +589,16 @@ failAllInflight env = do
           deliverReportIO m (DeliveryFailure (pmRecord m) "broker connection lost")
 
 -- | Push a delivery entry to the queue (IO version for use outside dispatch).
+-- | Convert a PendingMessage to a RecordInput for the batch encoder.
+toRecordInput :: PendingMessage -> RecordInput
+toRecordInput pm = RecordInput
+  { riKey = pmKey pm
+  , riValue = Just (pmPayload pm)
+  , riHeaders = pmHeaders pm
+  , riTimestampDelta = 0  -- broker-assigned timestamp
+  }
+{-# INLINE toRecordInput #-}
+
 deliverReportIO :: PendingMessage -> DeliveryReport -> IO ()
 deliverReportIO m dr = atomically $ do
   case pmSyncVar m of

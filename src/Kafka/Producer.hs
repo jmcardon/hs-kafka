@@ -58,6 +58,7 @@ import Kafka.Internal.Config
 import Kafka.Internal.InitProducerId.Request (initProducerIdRequest)
 import Kafka.Internal.InitProducerId.Response (InitProducerIdResponse(..),
   parseInitProducerIdResponseV4)
+import Kafka.Internal.Murmur2 (murmur2)
 import Kafka.Producer.Types
 import qualified Kafka.Internal.Wire as Wire
 
@@ -373,8 +374,8 @@ selectPartition :: KafkaProducer -> ProducerRecord -> Int32 -> IO Int32
 selectPartition producer record count = case prPartition record of
   SpecifiedPartition p -> pure p
   UnassignedPartition -> case prKey record of
-    Just _key -> nextPartitionRR producer (prTopic record) count
-    Nothing   -> nextPartitionRR producer (prTopic record) count
+    Just key -> pure (fromIntegral (murmur2 key `mod` count))
+    Nothing  -> nextPartitionRR producer (prTopic record) count
 
 nextPartitionRR :: KafkaProducer -> TopicName -> Int32 -> IO Int32
 nextPartitionRR producer topic count = do

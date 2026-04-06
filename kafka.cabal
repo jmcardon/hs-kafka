@@ -37,6 +37,7 @@ library
     Kafka.Internal.ListOffsets.Response
     Kafka.Internal.Metadata.Request
     Kafka.Internal.Metadata.Response
+    Kafka.Internal.Murmur2
     Kafka.Internal.OffsetCommit.Request
     Kafka.Internal.OffsetCommit.Response
     Kafka.Internal.OffsetFetch.Request

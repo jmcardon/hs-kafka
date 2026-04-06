@@ -21,7 +21,9 @@ import Kafka.Internal.Config (Compression(..))
 import Kafka.Internal.Fetch.Request
 import Kafka.Internal.JoinGroup.Request
 import Kafka.Internal.ListOffsets.Request
+import Kafka.Internal.Murmur2 (murmur2)
 import Kafka.Internal.Produce.Request (buildProduceRequest)
+import Kafka.Internal.RecordBatch (RecordInput(..))
 import Kafka.Internal.Produce.Response
 import Kafka.Internal.Wire (Wire, runWire)
 import Kafka.Internal.Zigzag
@@ -46,6 +48,7 @@ unitTests = testGroup "Unit tests"
   , consumerTests
   , errorCodeTests
   , compressionTests
+  , murmur2Tests
   , idempotentProduceTests
   ]
 
@@ -77,6 +80,10 @@ fromByteString = byteArrayFromList . B.unpack
 -- | Build a ByteString from a BuildR (for test response construction).
 buildBS :: BuildR -> B.ByteString
 buildBS = BL.toStrict . toLazyByteString
+
+-- | Wrap a ByteString as a value-only RecordInput (no key, no headers).
+ri :: B.ByteString -> RecordInput
+ri v = RecordInput Nothing (Just v) [] 0
 
 -- | Parse a Wire parser on BuildR output.
 wireParse :: Wire a -> BuildR -> Maybe a
@@ -259,6 +266,21 @@ compressionFallback name codec = testCase (name ++ " falls back for tiny data") 
   attr @?= 0
 
 ------------------------------------------------------------------------
+-- Murmur2 tests (Java Kafka producer compatible)
+------------------------------------------------------------------------
+
+murmur2Tests :: TestTree
+murmur2Tests = testGroup "Murmur2 (Java Kafka compatible)"
+  -- Expected values = librdkafka raw hash & 0x7fffffff (positive)
+  [ testCase "kafka"             $ murmur2 "kafka"             @?= 1348980580
+  , testCase "giberish123456789" $ murmur2 "giberish123456789" @?= 257239820
+  , testCase "1234"              $ murmur2 "1234"              @?= 533297940
+  , testCase "empty string"      $ murmur2 ""                  @?= 275646681
+  , testCase "always non-negative" $ assertBool ">= 0" (murmur2 "anything" >= 0)
+  , testCase "deterministic" $ murmur2 "key" @?= murmur2 "key"
+  ]
+
+------------------------------------------------------------------------
 -- Idempotent produce tests
 ------------------------------------------------------------------------
 
@@ -266,20 +288,20 @@ idempotentProduceTests :: TestTree
 idempotentProduceTests = testGroup "Idempotent produce"
   [ testCase "idempotent request encodes PID in record batch" $ do
       let req = buildProduceRequest 0 (-1) "kafka-native" 30000
-                  "test-topic" 0 42 1 0 NoCompression ["test message"]
+                  "test-topic" 0 42 1 0 NoCompression 0 [ri "test message"]
       assertBool "request should be non-empty" (B.length req > 0)
       let nonIdem = buildProduceRequest 0 (-1) "kafka-native" 30000
-                      "test-topic" 0 (-1) (-1) (-1) NoCompression ["test message"]
+                      "test-topic" 0 (-1) (-1) (-1) NoCompression 0 [ri "test message"]
       assertBool "idempotent request should differ from non-idempotent"
         (req /= nonIdem)
   , testCase "NoCompression is deterministic" $ do
-      let r1 = buildProduceRequest 0 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression ["test"]
-          r2 = buildProduceRequest 0 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression ["test"]
+      let r1 = buildProduceRequest 0 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0 [ri "test"]
+          r2 = buildProduceRequest 0 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0 [ri "test"]
       r1 @?= r2
   , testCase "Gzip compression produces different (shorter) bytes" $ do
       let payload = B.concat (replicate 50 "repetitive data for compression ")
-          compressed = buildProduceRequest 0 1 "test" 30000 "test" 0 (-1) (-1) (-1) Gzip [payload]
-          plain = buildProduceRequest 0 1 "test" 30000 "test" 0 (-1) (-1) (-1) NoCompression [payload]
+          compressed = buildProduceRequest 0 1 "test" 30000 "test" 0 (-1) (-1) (-1) Gzip 0 [ri payload]
+          plain = buildProduceRequest 0 1 "test" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0 [ri payload]
       assertBool "compressed should differ" (compressed /= plain)
       assertBool "compressed should be shorter" (B.length compressed < B.length plain)
   ]
@@ -339,16 +361,16 @@ goldenTests = testGroup "Golden tests"
 -- Produce golden tests use buildProduceRequest with corrId=0xbeef (legacy default).
 produceTest :: IO BL.ByteString
 produceTest = pure $ BL.fromStrict $ buildProduceRequest
-  0xbeef 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression
-  ["\"im not owned! im not owned!!\", i continue to insist as i slowlyshrink and transform into a corn cob"]
+  0xbeef 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0
+  [ri "\"im not owned! im not owned!!\", i continue to insist as i slowlyshrink and transform into a corn cob"]
 
 multipleProduceTest :: IO BL.ByteString
 multipleProduceTest = pure $ BL.fromStrict $ buildProduceRequest
-  0xbeef 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression
-  [ "i'm dying"
-  , "is it blissful?"
-  , "it's like a dream"
-  , "i want to dream"
+  0xbeef 1 "ruko" 30000 "test" 0 (-1) (-1) (-1) NoCompression 0
+  [ ri "i'm dying"
+  , ri "is it blissful?"
+  , ri "it's like a dream"
+  , ri "i want to dream"
   ]
 
 fetchTest :: IO BL.ByteString
