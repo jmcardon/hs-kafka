@@ -32,6 +32,7 @@ module Kafka.Producer
   , flush
   , drainDeliveryReports
   , rotatePartitions
+  , outboundQueueLength
     -- * Producing
   , produce
   , produceAsync
@@ -403,6 +404,23 @@ drainDeliveryReports producer timeoutMs = go 0 timeoutMs False
               then pure count  -- had reports, now empty → settled
               else go count (remaining - pollMs) False  -- keep waiting
             else go (count + length reports) (remaining - pollMs) True
+
+------------------------------------------------------------------------
+-- Queue inspection
+------------------------------------------------------------------------
+
+-- | Number of messages waiting in outbound queues (not yet sent).
+-- Matches rd_kafka_outq_len semantics.
+outboundQueueLength :: KafkaProducer -> IO Int
+outboundQueueLength producer = do
+  brokers <- readTVarIO (kcBrokers (kpClient producer))
+  counts <- mapM getBrokerQueueLen (IM.elems brokers)
+  pure (sum counts)
+  where
+    getBrokerQueueLen env = atomically $ do
+      opsLen <- lengthTBQueue (beOps env)
+      inflightLen <- readTVar (beInflightCount env)
+      pure (fromIntegral opsLen + inflightLen)
 
 ------------------------------------------------------------------------
 -- Internal: metadata + partitioning

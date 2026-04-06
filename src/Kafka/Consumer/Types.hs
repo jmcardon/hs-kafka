@@ -19,12 +19,14 @@ module Kafka.Consumer.Types
     -- * Group state
   , ConsumerGroupState(..)
   , JoinState(..)
+  , ConsumerMode(..)
   ) where
 
 import Control.Concurrent.STM (TVar, TBQueue)
 import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32, Int64)
 import Data.Map.Strict (Map)
+import Data.Set (Set)
 
 import Kafka.Common (TopicName, GroupName, KafkaException)
 import Kafka.Client (KafkaClient)
@@ -133,4 +135,14 @@ data KafkaConsumer = KafkaConsumer
   , consFetchQueue   :: !(TBQueue ConsumerRecord)
     -- ^ Messages from fetch responses, ready for poll.
   , consShutdown     :: !(TVar Bool)
+  , consPaused       :: !(TVar (Set (TopicName, Int32)))
+    -- ^ Paused partitions (fetch skips these).
+  , consMode         :: !(TVar ConsumerMode)
+    -- ^ Subscribe mode (group) or assign mode (direct).
   }
+
+-- | Consumer operating mode.
+data ConsumerMode
+  = ModeSubscribe   -- ^ Using consumer group (join/sync/heartbeat)
+  | ModeAssign      -- ^ Manual partition assignment (no group)
+  deriving (Eq, Show)

@@ -116,6 +116,7 @@ test-suite integration
     , async
     , base
     , bytestring
+    , containers
     , kafka
     , network
     , primitive

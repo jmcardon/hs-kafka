@@ -4,15 +4,17 @@ module Main (main) where
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.STM (readTVarIO, TMVar, newEmptyTMVarIO, putTMVar, readTMVar, atomically)
-import Control.Monad (forM, forM_, when)
+import Control.Monad (forM, forM_, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.Map.Strict as Map
 import Data.IORef
 import Test.Tasty
 import Test.Tasty.HUnit
 
 import Kafka.Client
 import Kafka.Common
+import Kafka.Consumer.New
 import Kafka.Internal.Broker (BrokerEnv(..), BrokerState(..))
 import Kafka.Internal.Config
 import Kafka.Producer
@@ -35,6 +37,7 @@ main = defaultMain $ testGroup "Integration"
   , retriableErrorTests
   , backpressureTests
   , loadTests
+  , consumerTests
   ]
 
 ------------------------------------------------------------------------
@@ -570,6 +573,131 @@ backpressureTests = testGroup "Backpressure"
             [0..9]
           let failures = filter isDeliveryFailure results
           assertEqual "all should succeed despite RTT" 0 (length failures)
+  ]
+
+------------------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+-- Consumer tests
+------------------------------------------------------------------------
+
+consumerTests :: TestTree
+consumerTests = testGroup "Consumer"
+  [ testCase "manual assign + poll" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "cons-test" 1 1
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+        -- Produce some messages first
+        Right client <- newClient cfg
+        Right producer <- newProducer client (defaultProducerConfig cfg)
+        forM_ [0..9 :: Int] $ \i ->
+          void $ produce producer (ProducerRecord "cons-test" (SpecifiedPartition 0)
+            Nothing (Just (BS.pack [fromIntegral i])) [])
+        void $ flush producer 5000
+        closeProducer producer
+        -- Now consume via manual assign (no consumer group)
+        let consCfg = (defaultConsumerConfig cfg "test-group" ["cons-test"])
+              { ccFetchWaitMs = 100 }  -- fast fetch cycle
+        Right consumer <- newConsumer client consCfg
+        assign consumer [TopicPartition "cons-test" 0 0]
+        -- Poll with generous timeout to allow fetch cycle to complete
+        records <- consumerPollBatch consumer 10000 100
+        closeConsumer consumer
+        closeClient client
+        assertBool ("should consume some messages, got " ++ show (length records))
+          (length records > 0)
+
+  , testCase "assignment and subscription queries" $
+      withMockCluster 1 $ \mc -> do
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+        mockCreateTopic mc "query-test" 1 1
+        Right client <- newClient cfg
+        let consCfg = defaultConsumerConfig cfg "query-group" ["query-test"]
+        Right consumer <- newConsumer client consCfg
+        -- Query subscription
+        subs <- subscription consumer
+        assertEqual "should be subscribed" ["query-test"] subs
+        -- Manual assign
+        assign consumer [TopicPartition "query-test" 0 0]
+        assigned <- assignment consumer
+        assertEqual "should have 1 partition" 1 (length assigned)
+        closeConsumer consumer
+        closeClient client
+
+  , testCase "seek changes fetch offset" $
+      withMockCluster 1 $ \mc -> do
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+        mockCreateTopic mc "seek-test" 1 1
+        Right client <- newClient cfg
+        let consCfg = defaultConsumerConfig cfg "seek-group" ["seek-test"]
+        Right consumer <- newConsumer client consCfg
+        assign consumer [TopicPartition "seek-test" 0 0]
+        -- Seek to offset 100
+        seek consumer "seek-test" 0 100
+        pos <- position consumer
+        case Map.lookup ("seek-test", 0) pos of
+          Just off -> assertEqual "offset should be 100" 100 off
+          Nothing -> assertFailure "position should have seek-test:0"
+        closeConsumer consumer
+        closeClient client
+
+  , testCase "pause and resume partitions" $
+      withMockCluster 1 $ \mc -> do
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+        mockCreateTopic mc "pause-test" 2 1
+        Right client <- newClient cfg
+        let consCfg = defaultConsumerConfig cfg "pause-group" ["pause-test"]
+        Right consumer <- newConsumer client consCfg
+        assign consumer [TopicPartition "pause-test" 0 0, TopicPartition "pause-test" 1 0]
+        -- Pause partition 0
+        pausePartitions consumer [("pause-test", 0)]
+        -- Query — partition 0 should be paused
+        -- (fetch loop skips paused partitions)
+        -- Resume
+        resumePartitions consumer [("pause-test", 0)]
+        closeConsumer consumer
+        closeClient client
+
+  , testCase "storeOffset updates position" $
+      withMockCluster 1 $ \mc -> do
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+        mockCreateTopic mc "store-test" 1 1
+        Right client <- newClient cfg
+        let consCfg = defaultConsumerConfig cfg "store-group" ["store-test"]
+        Right consumer <- newConsumer client consCfg
+        assign consumer [TopicPartition "store-test" 0 0]
+        -- Simulate a consumed record
+        let fakeRecord = ConsumerRecord "store-test" 0 42 0 Nothing (Just "data") []
+        storeOffset consumer fakeRecord
+        pos <- position consumer
+        case Map.lookup ("store-test", 0) pos of
+          Just off -> assertEqual "stored offset should be 43" 43 off
+          Nothing -> assertFailure "position should have store-test:0"
+        closeConsumer consumer
+        closeClient client
+
+  , testCase "withConsumer handles cleanup" $
+      withMockCluster 1 $ \mc -> do
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+        mockCreateTopic mc "with-cons-test" 1 1
+        Right client <- newClient cfg
+        let consCfg = defaultConsumerConfig cfg "with-group" ["with-cons-test"]
+        result <- withConsumer client consCfg $ \consumer -> do
+          subs <- subscription consumer
+          assertEqual "subscribed" ["with-cons-test"] subs
+          pure ()
+        case result of
+          Right () -> pure ()
+          Left err -> assertFailure ("withConsumer failed: " ++ show err)
+        closeClient client
   ]
 
 ------------------------------------------------------------------------
