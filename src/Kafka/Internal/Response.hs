@@ -1,82 +1,72 @@
-{-# language
-    LambdaCase
-  , RankNTypes
-  #-}
+{-# language LambdaCase #-}
 
 module Kafka.Internal.Response
-  ( fromKafkaResponse
-  , getKafkaResponse
+  ( getKafkaResponse
   , getResponseSizeHeader
-  , tryParse
+  , parseResponse
   ) where
 
-import Data.Bytes.Types
-import Data.Word (byteSwap32)
-import Socket.Stream.Interruptible.MutableBytes
-import System.IO
+import Control.Exception (try, IOException)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Network.Socket.ByteString as NBS
+import System.Timeout (timeout)
 
 import Kafka.Common
-import Kafka.Internal.Combinator
+import Kafka.Internal.Wire (Wire)
+import qualified Kafka.Internal.Wire as Wire
 
-import qualified Data.Bytes.Parser as Smith
+-- | Receive exactly n bytes from a socket, or fail.
+recvExact :: Kafka -> Int -> IO (Either KafkaException ByteString)
+recvExact kafka n = do
+  result <- try (go n [])
+  case result of
+    Left (e :: IOException) -> pure (Left (KafkaIOError (show e)))
+    Right bs -> pure (Right bs)
+  where
+    go 0 acc = pure (BS.concat (reverse acc))
+    go remaining acc = do
+      chunk <- NBS.recv (getSocket kafka) remaining
+      if BS.null chunk
+        then ioError (userError "connection closed by peer")
+        else go (remaining - BS.length chunk) (chunk : acc)
 
+-- | Read a full Kafka response (size header + body) as a ByteString.
+-- The @timeoutUs@ parameter is in microseconds. If the read does not
+-- complete within this time, returns a timeout error.
 getKafkaResponse ::
      Kafka
-  -> TVar Bool
-  -> IO (Either KafkaException ByteArray)
-getKafkaResponse kafka interrupt = do
-  getResponseSizeHeader kafka interrupt >>= \case
-    Right responseByteCount -> do
-      responseBuffer <- newByteArray responseByteCount
-      let responseBufferSlice = MutableBytes responseBuffer 0 responseByteCount
-      responseStatus <- first KafkaReceiveException <$>
-        receiveExactly
-          interrupt
-          (getKafka kafka)
-          responseBufferSlice
-      responseBytes <- unsafeFreezeByteArray responseBuffer
-      pure $ responseBytes <$ responseStatus
-    Left e -> pure (Left e)
+  -> Int        -- ^ Timeout in microseconds
+  -> IO (Either KafkaException ByteString)
+getKafkaResponse kafka timeoutUs = do
+  mResult <- timeout timeoutUs $
+    getResponseSizeHeader kafka >>= \case
+      Right byteCount -> recvExact kafka byteCount
+      Left e -> pure (Left e)
+  case mResult of
+    Nothing -> pure (Left (KafkaIOError "response read timed out"))
+    Just r  -> pure r
 
 getResponseSizeHeader ::
      Kafka
-  -> TVar Bool
   -> IO (Either KafkaException Int)
-getResponseSizeHeader kafka interrupt = do
-  responseSizeBuf <- newByteArray 4
-  responseStatus <- first KafkaReceiveException <$>
-    receiveExactly
-      interrupt
-      (getKafka kafka)
-      (MutableBytes responseSizeBuf 0 4)
-  byteCount <- fromIntegral . byteSwap32 <$> readByteArray responseSizeBuf 0
-  pure $ byteCount <$ responseStatus
+getResponseSizeHeader kafka = do
+  result <- recvExact kafka 4
+  case result of
+    Left e -> pure (Left e)
+    Right bs ->
+      let b0 = fromIntegral (BS.index bs 0) :: Int
+          b1 = fromIntegral (BS.index bs 1) :: Int
+          b2 = fromIntegral (BS.index bs 2) :: Int
+          b3 = fromIntegral (BS.index bs 3) :: Int
+      in pure (Right (b0 * 16777216 + b1 * 65536 + b2 * 256 + b3))
 
-logMaybe :: Show a => a -> Maybe Handle -> IO ()
-logMaybe a = \case
-  Nothing -> pure ()
-  Just h -> do
-    hPutStr h (show a ++ "\n\n")
-    hFlush h
-
-fromKafkaResponse :: (Show a)
-  => Parser a
-  -> Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String a))
-fromKafkaResponse parser kafka interrupt debugHandle =
-  getKafkaResponse kafka interrupt >>= \case
-    Right bytes -> do
-      let res = Smith.parseByteArray parser bytes
-      logMaybe res debugHandle
-      case res of
-        Smith.Failure e -> pure (Right (Left e))
-        Smith.Success (Smith.Slice _ _ a) -> pure (Right (Right a))
+-- | Read a response from the socket and parse it with a Wire parser.
+-- Used by old Consumer-path code that reads directly from a socket.
+parseResponse :: Wire a -> Kafka -> Int -> IO (Either KafkaException a)
+parseResponse parser kafka timeoutUs =
+  getKafkaResponse kafka timeoutUs >>= \case
     Left err -> pure (Left err)
-
-tryParse :: Either KafkaException (Either String a) -> Either KafkaException a
-tryParse = \case
-  Right (Right parsed) -> Right parsed
-  Right (Left parseError) -> Left (KafkaParseException parseError)
-  Left networkError -> Left networkError
+    Right bs -> case Wire.runWire parser bs of
+      Nothing -> pure (Left (KafkaParseException "wire parse failed"))
+      Just a  -> pure (Right a)

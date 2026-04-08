@@ -1,31 +1,24 @@
 packages: .
 
-source-repository-package
-  type: git
-  location: https://github.com/haskell-primitive/primitive-slice
-  tag: 554f1f0cf00d0c445b4210ce8367be5269e6ce64
+benchmarks: True
 
 source-repository-package
   type: git
-  location: https://github.com/andrewthad/castagnoli
-  tag: 08e2ceb5a88ccca7b3b56c3758be1d3942c2de49
+  location: https://github.com/jmcardon/hw-kafka-client.git
+  tag: 71444f399ff3c75cc36047b3faab35623113d720
 
-source-repository-package
-  type: git
-  location: https://github.com/andrewthad/sockets
-  tag: 3a87ec2a2828cde91d14a7c95ba470c0916037c0
+package hw-kafka-client
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include
 
-source-repository-package
-  type: git
-  location: https://github.com/haskell-primitive/primitive-convenience
-  tag: 09c33eb713198de38eee57b4af370098030a9dde
+package snappy
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include
 
-source-repository-package
-  type: git
-  location: https://github.com/andrewthad/bytesmith
-  tag: 065fa9fbf798d31d625a47ed85808e47c0bf3910
+package lz4
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include
 
-source-repository-package
-  type: git
-  location: https://github.com/chessai/string
-  tag: 0618faa1d608b3b06108dd6e6c7478f8f511e05f
+package zstd
+  extra-lib-dirs: /opt/homebrew/lib
+  extra-include-dirs: /opt/homebrew/include

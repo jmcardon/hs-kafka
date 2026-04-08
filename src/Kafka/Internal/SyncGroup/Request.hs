@@ -1,16 +1,15 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
 
 module Kafka.Internal.SyncGroup.Request
   ( syncGroupRequest
   ) where
 
-import Data.Primitive.Unlifted.Array
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BSL
+import Data.Int (Int16)
 
 import Kafka.Common
 import Kafka.Internal.Writer
-
-import qualified String.Ascii as S
 
 syncGroupApiVersion :: Int16
 syncGroupApiVersion = 2
@@ -18,7 +17,7 @@ syncGroupApiVersion = 2
 syncGroupApiKey :: Int16
 syncGroupApiKey = 14
 
-defaultAssignmentData :: MemberAssignment -> Builder
+defaultAssignmentData :: MemberAssignment -> BuildR
 defaultAssignmentData assignment =
   let
     assn = mconcat
@@ -33,35 +32,25 @@ defaultAssignmentData assignment =
           )
       , int32 0 -- userdata bytes length
       ]
-  in bytearray memId memIdSize
-    <> int32 (size32 (build assn))
+    assnBytes = BSL.toStrict (toLazyByteString assn)
+  in bytearray memId
+    <> int32 (fromIntegral (BS.length assnBytes))
     <> assn
   where
     memId = assignedMemberId assignment
-    memIdSize = fromIntegral $ sizeofByteArray memId
 
 syncGroupRequest ::
      GroupMember
   -> GenerationId
   -> [MemberAssignment]
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
 syncGroupRequest (GroupMember (GroupName gid) mid) (GenerationId genId) assignments =
-  let
-    groupIdLength = S.length gid
-    reqSize = build $
-      int32 (fromIntegral $ sizeofByteArray req)
-    req = build $
-      int16 syncGroupApiKey
-      <> int16 syncGroupApiVersion
-      <> int32 correlationId
-      <> string clientId (fromIntegral clientIdLength)
-      <> string gid (fromIntegral groupIdLength)
-      <> int32 genId
-      <> maybe (int16 0) (\m -> bytearray m (sizeofByteArray m)) mid
-      <> mapArray assignments defaultAssignmentData
-  in
-    runUnliftedArray $ do
-      arr <- newUnliftedArray 2 mempty
-      writeUnliftedArray arr 0 reqSize
-      writeUnliftedArray arr 1 req
-      pure arr
+  buildRequest $
+    int16 syncGroupApiKey
+    <> int16 syncGroupApiVersion
+    <> int32 correlationId
+    <> string clientId
+    <> string gid
+    <> int32 genId
+    <> maybe (int16 0) (\m -> bytearray m) mid
+    <> mapArray assignments defaultAssignmentData

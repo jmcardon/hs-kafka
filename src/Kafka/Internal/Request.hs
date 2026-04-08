@@ -1,7 +1,5 @@
-{-# language
-    LambdaCase
-  , RecordWildCards
-  #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Kafka.Internal.Request
   ( fetch
@@ -17,9 +15,11 @@ module Kafka.Internal.Request
   , syncGroup
   ) where
 
-import Data.Primitive.Unlifted.Array
-import Socket.Stream.Uninterruptible.Bytes
-import System.IO (hPutStr, hFlush)
+import Control.Exception (try, IOException)
+import qualified Data.ByteString.Lazy as BSL
+import Data.IORef
+import qualified Network.Socket.ByteString.Lazy as NBSL
+import System.IO (Handle, hPutStr, hFlush)
 
 import Kafka.Common
 import Kafka.Internal.Fetch.Request
@@ -31,17 +31,22 @@ import Kafka.Internal.ListOffsets.Request
 import Kafka.Internal.Metadata.Request
 import Kafka.Internal.OffsetCommit.Request
 import Kafka.Internal.OffsetFetch.Request
-import Kafka.Internal.Produce.Request
+import Kafka.Internal.Config (Compression(..))
+import Kafka.Internal.RecordBatch (RecordInput(..))
+import Kafka.Internal.Produce.Request (ProduceRequestParams(..), buildProduceRequest)
 import Kafka.Internal.Request.Types
 import Kafka.Internal.ShowDebug
 import Kafka.Internal.SyncGroup.Request
 
 request ::
      Kafka
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
   -> IO (Either KafkaException ())
-request kafka msg = first KafkaSendException
-  <$> sendMany (getKafka kafka) msg
+request kafka msg = do
+  result <- try (NBSL.sendAll (getSocket kafka) msg)
+  case result of
+    Left (e :: IOException) -> pure (Left (KafkaIOError (show e)))
+    Right () -> pure (Right ())
 
 logHandle :: Maybe Handle -> String -> IO ()
 logHandle handle str =
@@ -60,12 +65,14 @@ produce kafka req@ProduceRequest{..} handle = do
   logHandle handle (showDebug req)
   let Topic topicName parts ctr = produceTopic
   p <- fromIntegral <$> readIORef ctr
-  let message = produceRequest
-        (produceWaitTime `div` 1000)
-        topicName
-        p
-        producePayloads
-  request kafka message >>= \case
+  let toRI v = RecordInput Nothing (Just v) [] 0
+      message = buildProduceRequest ProduceRequestParams
+        { prpCorrId = correlationId, prpAcks = 1, prpClientId = clientId
+        , prpTimeoutMs = produceWaitTime `div` 1000, prpTopic = topicName
+        , prpPartition = p, prpProducerId = -1, prpProducerEpoch = -1
+        , prpBaseSequence = -1, prpCompression = NoCompression, prpFirstTs = 0
+        } (map toRI producePayloads)
+  request kafka (BSL.fromStrict message) >>= \case
     Left err -> pure (Left err)
     Right a -> do
       increment parts ctr
@@ -205,3 +212,4 @@ metadata kafka req@MetadataRequest{..} handle = do
   request kafka $ metadataRequest
     metadataTopic
     metadataAutoCreateTopic
+

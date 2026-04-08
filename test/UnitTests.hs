@@ -3,45 +3,54 @@
 module Main (main) where
 
 import Data.Int
-import Data.Primitive.ByteArray
-import Data.Primitive.Unlifted.Array
+import Data.Primitive.ByteArray (ByteArray, byteArrayFromList, sizeofByteArray)
 import Data.Word
 import Test.Tasty
 import Test.Tasty.Golden
 import Test.Tasty.HUnit
-import Prelude hiding (readFile)
-import Data.ByteString (ByteString)
 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC8
 import qualified Data.ByteString.Lazy as BL
-import qualified Data.Bytes.Parser as Smith
-import qualified String.Ascii as S
 import qualified Data.IntMap as IM
-
-import Data.Bytes.Parser (Result(..))
 
 import Kafka.Common
 import Kafka.Consumer (merge)
-import Kafka.Internal.Combinator
+import Kafka.Internal.Compression (compressBatch, decompressBatch)
+import Kafka.Internal.Config (Compression(..))
 import Kafka.Internal.Fetch.Request
 import Kafka.Internal.JoinGroup.Request
 import Kafka.Internal.ListOffsets.Request
-import Kafka.Internal.Produce.Request
+import Kafka.Internal.Murmur2 (murmur2)
+import Kafka.Internal.Produce.Request (ProduceRequestParams(..), buildProduceRequest)
+import qualified Kafka.Internal.RecordBatch
+import Kafka.Internal.RecordBatch (RecordInput(..))
 import Kafka.Internal.Produce.Response
+import Kafka.Internal.Wire (Wire, runWire)
 import Kafka.Internal.Zigzag
 import qualified Kafka.Internal.Fetch.Response as Fetch
+import Kafka.Internal.ApiVersions.Response (ApiVersionsResponse(..), ApiVersionEntry(..),
+  parseApiVersionsResponse, parseApiVersionsResponseV3)
+import Kafka.Internal.InitProducerId.Response (InitProducerIdResponse(..),
+  parseInitProducerIdResponse, parseInitProducerIdResponseV4)
+import Kafka.Internal.Writer (BuildR, toLazyByteString)
 import qualified Kafka.Internal.Writer as W
 
+import WireTests (wireTests)
+
 main :: IO ()
-main = defaultMain (testGroup "Tests" [unitTests, goldenTests])
+main = defaultMain (testGroup "Tests" [unitTests, goldenTests, wireTests])
 
 unitTests :: TestTree
 unitTests = testGroup "Unit tests"
   [ zigzagTests
-  , parserTests
+  , apiVersionsTests
   , responseParserTests
   , consumerTests
+  , errorCodeTests
+  , compressionTests
+  , murmur2Tests
+  , idempotentProduceTests
   ]
 
 zigzagTests :: TestTree
@@ -66,46 +75,292 @@ zigzagTests = testGroup "zigzag"
       (zigzag 150 @?= byteArrayFromList [172, 2 :: Word8])
   ]
 
-readFile :: FilePath -> IO S.String
-readFile fp = do
-  b <- B.readFile fp
-  pure (S.unsafeFromByteArray (fromByteString b))
-
-fromByteString :: ByteString -> ByteArray
+fromByteString :: B.ByteString -> ByteArray
 fromByteString = byteArrayFromList . B.unpack
 
-toByteString :: ByteArray -> ByteString
-toByteString = B.pack . foldrByteArray (:) []
+-- | Build a ByteString from a BuildR (for test response construction).
+buildBS :: BuildR -> B.ByteString
+buildBS = BL.toStrict . toLazyByteString
 
-parserTests :: TestTree
-parserTests = testGroup "Parsers"
-  [ testCase
-      "int32 [0, 0, 0, 255] is 255"
-      (Smith.parseByteArray (int32 "") (byteArrayFromList [0,0,0,255 :: Word8]) @?= Success (Smith.Slice 4 0 255))
-  , testCase
-      "int32 [0x12, 0x34, 0x56, 0x78] is 305419896"
-      (Smith.parseByteArray (int32 "") (byteArrayFromList [0x12, 0x34, 0x56, 0x78 :: Int8]) @?= Success (Smith.Slice 4 0 305419896))
-  , testCase
-      "parseVarint (zigzag 0) is 0"
-      (Smith.parseByteArray varInt (zigzag 0) @?= Success (Smith.Slice 1 0 0))
-  , testCase
-      "parseVarint (zigzag 10) is 10"
-      (Smith.parseByteArray varInt (zigzag 10) @?= Success (Smith.Slice 1 0 10))
-  , testCase
-      "parseVarint (zigzag 150) is 150"
-      (Smith.parseByteArray varInt (zigzag 150) @?= Success (Smith.Slice 2 0 150))
-  , testCase
-      "parseVarint (zigzag 1000) is 1000"
-      (Smith.parseByteArray varInt (zigzag 1000) @?= Success (Smith.Slice 2 0 1000))
-  , testCase
-      "parseVarint (zigzag (-1)) is (-1)"
-      (Smith.parseByteArray varInt (zigzag (-1)) @?= Success (Smith.Slice 1 0 (-1)))
+-- | Wrap a ByteString as a value-only RecordInput (no key, no headers).
+ri :: B.ByteString -> RecordInput
+ri v = RecordInput Nothing (Just v) [] 0
+
+-- | Default produce request params for tests.
+testParams :: Int32 -> Int16 -> B.ByteString -> TopicName -> ProduceRequestParams
+testParams corrId acks cid topic = ProduceRequestParams
+  { prpCorrId = corrId, prpAcks = acks, prpClientId = cid
+  , prpTimeoutMs = 30000, prpTopic = topic, prpPartition = 0
+  , prpProducerId = -1, prpProducerEpoch = -1, prpBaseSequence = -1
+  , prpCompression = NoCompression, prpFirstTs = 0
+  }
+
+-- | Parse a Wire parser on BuildR output.
+wireParse :: Wire a -> BuildR -> Maybe a
+wireParse p = runWire p . buildBS
+
+apiVersionsTests :: TestTree
+apiVersionsTests = testGroup "ApiVersions + InitProducerId"
+  [ testCase "parse ApiVersionsResponse v0 (legacy) with 2 entries" $
+      let responseBytes = buildBS $
+            W.int32 0           -- correlationId
+            <> W.int16 0        -- errorCode (no error)
+            <> W.int32 2        -- array length: 2 entries
+            <> W.int16 0        -- apiKey: Produce
+            <> W.int16 0        -- minVersion
+            <> W.int16 7        -- maxVersion
+            <> W.int16 1        -- apiKey: Fetch
+            <> W.int16 0        -- minVersion
+            <> W.int16 10       -- maxVersion
+          expected = ApiVersionsResponse 0
+            [ ApiVersionEntry 0 0 7
+            , ApiVersionEntry 1 0 10
+            ] 0
+      in case runWire parseApiVersionsResponse responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse failed"
+  , testCase "parse ApiVersionsResponse v3 (flexible) with tagged fields" $
+      let responseBytes = buildBS $
+            W.int32 42          -- correlationId
+            <> W.int16 0        -- errorCode
+            -- compact array: 2 entries → varint(3)
+            <> W.unsignedVarInt 3
+            -- entry 1
+            <> W.int16 0        -- apiKey: Produce
+            <> W.int16 0 <> W.int16 9  -- minVersion, maxVersion
+            <> W.unsignedVarInt 0      -- entry tagged fields
+            -- entry 2
+            <> W.int16 18       -- apiKey: ApiVersions
+            <> W.int16 0 <> W.int16 3  -- minVersion, maxVersion
+            <> W.unsignedVarInt 0      -- entry tagged fields
+            -- throttle time
+            <> W.int32 100
+            -- body tagged fields
+            <> W.unsignedVarInt 0
+          expected = ApiVersionsResponse 0
+            [ ApiVersionEntry 0 0 9
+            , ApiVersionEntry 18 0 3
+            ] 100
+      in case runWire parseApiVersionsResponseV3 responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse v3 failed"
+  , testCase "parse ApiVersionsResponse v3 with error code" $
+      let responseBytes = buildBS $
+            W.int32 0           -- correlationId
+            <> W.int16 35       -- errorCode (UnsupportedVersion)
+            <> W.unsignedVarInt 1  -- empty compact array
+            <> W.int32 0        -- throttle time
+            <> W.unsignedVarInt 0  -- body tagged fields
+      in case runWire parseApiVersionsResponseV3 responseBytes of
+        Just resp -> avErrorCode resp @?= 35
+        Nothing -> assertFailure "parse failed"
+  , testCase "parse InitProducerIdResponse v0 (legacy)" $
+      let responseBytes = buildBS $
+            W.int32 0           -- correlationId
+            <> W.int32 0        -- throttleTimeMs
+            <> W.int16 0        -- errorCode
+            <> W.int64 12345    -- producerId
+            <> W.int16 0        -- producerEpoch
+          expected = InitProducerIdResponse 0 0 12345 0
+      in case runWire parseInitProducerIdResponse responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse failed"
+  , testCase "parse InitProducerIdResponse v4 (flexible)" $
+      let responseBytes = buildBS $
+            W.int32 99          -- correlationId
+            <> W.unsignedVarInt 0  -- header v1 tagged fields
+            <> W.int32 50       -- throttleTimeMs
+            <> W.int16 0        -- errorCode (no error)
+            <> W.int64 999      -- producerId
+            <> W.int16 5        -- producerEpoch
+            <> W.unsignedVarInt 0  -- body tagged fields
+          expected = InitProducerIdResponse 50 0 999 5
+      in case runWire parseInitProducerIdResponseV4 responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse v4 failed"
+  , testCase "parse InitProducerIdResponse v4 with error" $
+      let responseBytes = buildBS $
+            W.int32 0
+            <> W.unsignedVarInt 0  -- header v1 tagged fields
+            <> W.int32 0        -- throttleTimeMs
+            <> W.int16 45       -- errorCode (OutOfOrderSequenceNumber)
+            <> W.int64 (-1)     -- producerId
+            <> W.int16 (-1)     -- producerEpoch
+            <> W.unsignedVarInt 0
+      in case runWire parseInitProducerIdResponseV4 responseBytes of
+        Just resp -> ipErrorCode resp @?= 45
+        Nothing -> assertFailure "parse failed"
   ]
 
 responseParserTests :: TestTree
 responseParserTests = testGroup "Response parsers"
   [ produceResponseTest
+  , produceResponseV9Test
   , fetchResponseTest
+  ]
+
+------------------------------------------------------------------------
+-- Error code tests
+------------------------------------------------------------------------
+
+errorCodeTests :: TestTree
+errorCodeTests = testGroup "Error codes"
+  [ testCase "fromErrorCode 0 is None" $
+      fromErrorCode 0 @?= Just None
+  , testCase "fromErrorCode 5 is LeaderNotAvailable" $
+      fromErrorCode 5 @?= Just LeaderNotAvailable
+  , testCase "fromErrorCode 6 is NotLeaderForPartition" $
+      fromErrorCode 6 @?= Just NotLeaderForPartition
+  , testCase "fromErrorCode 999 is Nothing" $
+      fromErrorCode 999 @?= Nothing
+  , testCase "isRetriable LeaderNotAvailable" $
+      isRetriable LeaderNotAvailable @?= True
+  , testCase "isRetriable NotLeaderForPartition" $
+      isRetriable NotLeaderForPartition @?= True
+  , testCase "isRetriable RequestTimedOut" $
+      isRetriable RequestTimedOut @?= True
+  , testCase "isRetriable NotEnoughReplicas" $
+      isRetriable NotEnoughReplicas @?= True
+  , testCase "isRetriable NotEnoughReplicasAfterAppend" $
+      isRetriable NotEnoughReplicasAfterAppend @?= True
+  , testCase "not isRetriable MessageTooLarge" $
+      isRetriable MessageTooLarge @?= False
+  , testCase "not isRetriable InvalidRequiredAcks" $
+      isRetriable InvalidRequiredAcks @?= False
+  , testCase "not isRetriable TopicAuthorizationFailed" $
+      isRetriable TopicAuthorizationFailed @?= False
+  , testCase "not isRetriable OutOfOrderSequenceNumber" $
+      isRetriable OutOfOrderSequenceNumber @?= False
+  ]
+
+------------------------------------------------------------------------
+-- Compression tests
+------------------------------------------------------------------------
+
+compressionTests :: TestTree
+compressionTests = testGroup "Compression"
+  [ testCase "NoCompression passthrough" $ do
+      let payload = "hello world"
+          (result, attr) = compressBatch NoCompression payload
+      attr @?= 0
+      result @?= payload
+  , compressionRoundTrip "Gzip" Gzip 1
+  , compressionRoundTrip "Snappy" Snappy 2
+  , compressionRoundTrip "Lz4" Lz4 3
+  , compressionRoundTrip "Zstd" Zstd 4
+  , compressionFallback "Gzip" Gzip
+  , compressionFallback "Snappy" Snappy
+  , compressionFallback "Lz4" Lz4
+  , compressionFallback "Zstd" Zstd
+  , testCase "decompressBatch 0 is passthrough" $
+      decompressBatch 0 "hello" @?= Right "hello"
+  , testCase "decompressBatch unknown codec returns error" $
+      case decompressBatch 99 "data" of
+        Left _ -> pure ()
+        Right _ -> assertFailure "expected error for unknown codec"
+  ]
+
+-- | Round-trip test: compress repetitive data, verify attribute, decompress, compare.
+compressionRoundTrip :: String -> Compression -> Int16 -> TestTree
+compressionRoundTrip name codec expectedAttr = testCase (name ++ " round-trips") $ do
+  let rawBS = B.concat (replicate 100 "hello world, this is a test payload for compression. ")
+      (compressed, attr) = compressBatch codec rawBS
+  attr @?= expectedAttr
+  case decompressBatch (fromIntegral attr) compressed of
+    Left err -> assertFailure ("decompression failed: " ++ err)
+    Right decompressed -> decompressed @?= rawBS
+
+compressionFallback :: String -> Compression -> TestTree
+compressionFallback name codec = testCase (name ++ " falls back for tiny data") $ do
+  let (_, attr) = compressBatch codec "hi"
+  attr @?= 0
+
+------------------------------------------------------------------------
+-- Murmur2 tests (Java Kafka producer compatible)
+------------------------------------------------------------------------
+
+murmur2Tests :: TestTree
+murmur2Tests = testGroup "Murmur2 (Java Kafka compatible)"
+  -- Expected values = librdkafka raw hash & 0x7fffffff (positive)
+  [ testCase "kafka"             $ murmur2 "kafka"             @?= 1348980580
+  , testCase "giberish123456789" $ murmur2 "giberish123456789" @?= 257239820
+  , testCase "1234"              $ murmur2 "1234"              @?= 533297940
+  , testCase "empty string"      $ murmur2 ""                  @?= 275646681
+  , testCase "always non-negative" $ assertBool ">= 0" (murmur2 "anything" >= 0)
+  , testCase "deterministic" $ murmur2 "key" @?= murmur2 "key"
+  ]
+
+------------------------------------------------------------------------
+-- Idempotent produce tests
+------------------------------------------------------------------------
+
+idempotentProduceTests :: TestTree
+idempotentProduceTests = testGroup "Idempotent produce"
+  [ testCase "idempotent request encodes PID in record batch" $ do
+      let req = buildProduceRequest (testParams 0 (-1) "kafka-native" "test-topic")
+                  { prpProducerId = 42, prpProducerEpoch = 1, prpBaseSequence = 0 }
+                  [ri "test message"]
+      assertBool "request should be non-empty" (B.length req > 0)
+      let nonIdem = buildProduceRequest (testParams 0 (-1) "kafka-native" "test-topic")
+                      [ri "test message"]
+      assertBool "idempotent request should differ from non-idempotent"
+        (req /= nonIdem)
+  , testCase "NoCompression is deterministic" $ do
+      let p = testParams 0 1 "ruko" "test"
+          r1 = buildProduceRequest p [ri "test"]
+          r2 = buildProduceRequest p [ri "test"]
+      r1 @?= r2
+  , testCase "Gzip compression produces different (shorter) bytes" $ do
+      let payload = B.concat (replicate 50 "repetitive data for compression ")
+          compressed = buildProduceRequest (testParams 0 1 "test" "test") { prpCompression = Gzip } [ri payload]
+          plain = buildProduceRequest (testParams 0 1 "test" "test") [ri payload]
+      assertBool "compressed should differ" (compressed /= plain)
+      assertBool "compressed should be shorter" (B.length compressed < B.length plain)
+  , compressionRequestTests
+  ]
+
+-- | Verify every codec actually compresses at the request level with realistic batches.
+-- Uses multiple records of repetitive data (like the benchmark) and verifies:
+--   1. Request is shorter than uncompressed
+--   2. Attributes in the record batch have the correct codec bits
+--   3. The compressed records round-trip through decompressBatch
+compressionRequestTests :: TestTree
+compressionRequestTests = testGroup "Compression in produce request"
+  [ compressionRequestTest "Gzip"   Gzip   1
+  , compressionRequestTest "Snappy" Snappy 2
+  , compressionRequestTest "Lz4"    Lz4    3
+  , compressionRequestTest "Zstd"   Zstd   4
+  ]
+
+compressionRequestTest :: String -> Compression -> Int16 -> TestTree
+compressionRequestTest name codec expectedAttr = testGroup name
+  [ testCase "request is shorter with multi-record batch" $ do
+      let records = replicate 100 (ri (B.replicate 100 0x41))
+          params  = testParams 0 1 "t" "t"
+          plain   = buildProduceRequest params records
+          comp    = buildProduceRequest params { prpCompression = codec } records
+      assertBool ("compressed request should be shorter: plain="
+                  ++ show (B.length plain) ++ " comp=" ++ show (B.length comp))
+        (B.length comp < B.length plain)
+  , testCase "record batch attributes has correct codec bits" $ do
+      let records = replicate 100 (ri (B.replicate 100 0x41))
+          rawRecords = Kafka.Internal.RecordBatch.buildRecords records
+          (compressed, attr) = compressBatch codec rawRecords
+      -- With 100 records of 100 bytes each, compression must help
+      assertBool "compression should activate (attr /= 0)" (attr /= 0)
+      attr @?= expectedAttr
+      -- Verify the compressed data is actually shorter
+      assertBool ("compressed records should be shorter: raw="
+                  ++ show (B.length rawRecords) ++ " comp=" ++ show (B.length compressed))
+        (B.length compressed < B.length rawRecords)
+  , testCase "compressed records round-trip through decompress" $ do
+      let records = replicate 100 (ri (B.replicate 100 0x41))
+          rawRecords = Kafka.Internal.RecordBatch.buildRecords records
+          (compressed, attr) = compressBatch codec rawRecords
+      assertBool "compression should activate" (attr /= 0)
+      case decompressBatch (fromIntegral attr) compressed of
+        Left err -> assertFailure ("decompression failed: " ++ err)
+        Right decompressed -> decompressed @?= rawRecords
   ]
 
 goldenTests :: TestTree
@@ -156,72 +411,48 @@ goldenTests = testGroup "Golden tests"
           (joinGroupTest
             (GroupMember
               ("test-group")
-              (Just $ fromByteString "test-member-id")))
+              (Just "test-member-id")))
       ]
   ]
 
-toSpec :: UnliftedArray ByteArray -> BL.ByteString
-toSpec = BL.fromStrict . toByteString . unChunks
-
+-- Produce golden tests use buildProduceRequest with corrId=0xbeef (legacy default).
 produceTest :: IO BL.ByteString
-produceTest = do
-  let payload = fromByteString $ "\"im not owned! im not owned!!\", i continue to insist as i slowlyshrink and transform into a corn cob"
-  payloads <- do
-    payloads <- newUnliftedArray 1 payload
-    freezeUnliftedArray payloads 0 1
-  let req = produceRequest 30000 "test" 0 payloads
-  pure (toSpec req)
-
-unChunks :: UnliftedArray ByteArray -> ByteArray
-unChunks = foldrUnliftedArray (<>) mempty
+produceTest = pure $ BL.fromStrict $ buildProduceRequest
+  (testParams 0xbeef 1 "ruko" "test")
+  [ri "\"im not owned! im not owned!!\", i continue to insist as i slowlyshrink and transform into a corn cob"]
 
 multipleProduceTest :: IO BL.ByteString
-multipleProduceTest = do
-  let payloads = unliftedArrayFromList
-        [ fromByteString "i'm dying"
-        , fromByteString "is it blissful?"
-        , fromByteString "it's like a dream"
-        , fromByteString "i want to dream"
-        ]
-  let req = produceRequest 30000 "test" 0 payloads
-  pure (toSpec req)
+multipleProduceTest = pure $ BL.fromStrict $ buildProduceRequest
+  (testParams 0xbeef 1 "ruko" "test")
+  [ri "i'm dying", ri "is it blissful?", ri "it's like a dream", ri "i want to dream"]
 
 fetchTest :: IO BL.ByteString
-fetchTest = do
-  pure (toSpec (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0] 30000000))
+fetchTest = pure (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0] 30000000)
 
 multipleFetchTest :: IO BL.ByteString
-multipleFetchTest = do
-  pure (toSpec (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0, PartitionOffset 1 0, PartitionOffset 2 0] 30000000))
+multipleFetchTest = pure (sessionlessFetchRequest 30000 "test" [PartitionOffset 0 0, PartitionOffset 1 0, PartitionOffset 2 0] 30000000)
 
 listOffsetsTest :: [Int32] -> IO BL.ByteString
-listOffsetsTest partitions = do
-  pure (toSpec (listOffsetsRequest "test" partitions Latest))
+listOffsetsTest partitions = pure (listOffsetsRequest "test" partitions Latest)
 
 joinGroupTest :: GroupMember -> IO BL.ByteString
-joinGroupTest groupMember = do
-  pure (toSpec (joinGroupRequest "test" groupMember))
+joinGroupTest groupMember = pure (joinGroupRequest "test" groupMember)
 
 produceResponseTest :: TestTree
 produceResponseTest = testGroup "Produce"
   [ testCase
       "One message"
-      (parseProduce oneMsgProduceResponseBytes @?=
-        Success (Smith.Slice 58 0 oneMsgProduceResponse))
+      (runWire parseProduceResponse oneMsgProduceResponseBytes @?= Just oneMsgProduceResponse)
   , testCase
       "Two messages"
-      (parseProduce twoMsgProduceResponseBytes @?=
-        Success (Smith.Slice 88 0 twoMsgProduceResponse))
+      (runWire parseProduceResponse twoMsgProduceResponseBytes @?= Just twoMsgProduceResponse)
   ]
 
-parseProduce :: ByteArray -> Result String ProduceResponse
-parseProduce = Smith.parseByteArray parseProduceResponse
-
-oneMsgProduceResponseBytes :: ByteArray
-oneMsgProduceResponseBytes = W.build $
+oneMsgProduceResponseBytes :: B.ByteString
+oneMsgProduceResponseBytes = buildBS $
   W.int32 0
   <> W.int32 1
-  <> W.string "topic-name" 10
+  <> W.string "topic-name"
   <> W.int32 1
   <> W.int32 10
   <> W.int16 11
@@ -230,11 +461,11 @@ oneMsgProduceResponseBytes = W.build $
   <> W.int64 14
   <> W.int32 1
 
-twoMsgProduceResponseBytes :: ByteArray
-twoMsgProduceResponseBytes = W.build $
+twoMsgProduceResponseBytes :: B.ByteString
+twoMsgProduceResponseBytes = buildBS $
   W.int32 0
   <> W.int32 1
-  <> W.string "topic-name" 10
+  <> W.string "topic-name"
   <> W.int32 2
   <> W.int32 10
   <> W.int16 11
@@ -295,16 +526,103 @@ twoMsgProduceResponse =
     , throttleTimeMs = 1
     }
 
+-- | Test Produce v9 response parsing (flexible/compact encoding).
+produceResponseV9Test :: TestTree
+produceResponseV9Test = testGroup "Produce v9 (flexible)"
+  [ testCase "parse v9 response with success" $
+      let responseBytes = buildBS $
+            W.int32 0           -- correlationId
+            <> W.unsignedVarInt 0  -- header v1 tagged fields
+            -- compact array of topic responses: 1 topic → varint(2)
+            <> W.unsignedVarInt 2
+            -- TopicProduceResponse
+            <> W.compactString "my-topic"
+            -- compact array of partition responses: 1 partition → varint(2)
+            <> W.unsignedVarInt 2
+            -- PartitionProduceResponse
+            <> W.int32 0        -- partition
+            <> W.int16 0        -- errorCode (success)
+            <> W.int64 100      -- baseOffset
+            <> W.int64 (-1)     -- logAppendTime
+            <> W.int64 0        -- logStartOffset
+            <> W.unsignedVarInt 0  -- partition tagged fields
+            <> W.unsignedVarInt 0  -- topic tagged fields
+            -- throttle time
+            <> W.int32 0
+            -- body tagged fields
+            <> W.unsignedVarInt 0
+          expected = ProduceResponse
+            { produceResponseMessages =
+                [ ProduceResponseMessage
+                    { prMessageTopic = "my-topic"
+                    , prPartitionResponses =
+                        [ ProducePartitionResponse 0 0 100 (-1) 0
+                        ]
+                    }
+                ]
+            , throttleTimeMs = 0
+            }
+      in case runWire parseProduceResponseV9 responseBytes of
+        Just resp -> resp @?= expected
+        Nothing -> assertFailure "parse v9 failed"
+  , testCase "parse v9 response with error code" $
+      let responseBytes = buildBS $
+            W.int32 0
+            <> W.unsignedVarInt 0  -- header v1 tagged fields
+            <> W.unsignedVarInt 2  -- 1 topic
+            <> W.compactString "test"
+            <> W.unsignedVarInt 2  -- 1 partition
+            <> W.int32 0           -- partition
+            <> W.int16 6           -- errorCode: NotLeaderForPartition
+            <> W.int64 (-1) <> W.int64 (-1) <> W.int64 (-1)
+            <> W.unsignedVarInt 0  -- partition tf
+            <> W.unsignedVarInt 0  -- topic tf
+            <> W.int32 0           -- throttle
+            <> W.unsignedVarInt 0  -- body tf
+      in case runWire parseProduceResponseV9 responseBytes of
+        Just resp -> do
+          let partResp = head (prPartitionResponses (head (produceResponseMessages resp)))
+          prResponseErrorCode partResp @?= 6
+        Nothing -> assertFailure "parse v9 failed"
+  , testCase "parse v9 response with multiple partitions" $
+      let responseBytes = buildBS $
+            W.int32 0
+            <> W.unsignedVarInt 0  -- header v1 tagged fields
+            <> W.unsignedVarInt 2  -- 1 topic
+            <> W.compactString "multi-part"
+            <> W.unsignedVarInt 4  -- 3 partitions
+            -- partition 0: success
+            <> W.int32 0 <> W.int16 0 <> W.int64 10 <> W.int64 (-1) <> W.int64 0
+            <> W.unsignedVarInt 0
+            -- partition 1: error
+            <> W.int32 1 <> W.int16 5 <> W.int64 (-1) <> W.int64 (-1) <> W.int64 (-1)
+            <> W.unsignedVarInt 0
+            -- partition 2: success
+            <> W.int32 2 <> W.int16 0 <> W.int64 20 <> W.int64 (-1) <> W.int64 0
+            <> W.unsignedVarInt 0
+            <> W.unsignedVarInt 0  -- topic tf
+            <> W.int32 0
+            <> W.unsignedVarInt 0  -- body tf
+      in case runWire parseProduceResponseV9 responseBytes of
+        Just resp -> do
+          let parts = prPartitionResponses (head (produceResponseMessages resp))
+          length parts @?= 3
+          prResponseErrorCode (parts !! 0) @?= 0
+          prResponseErrorCode (parts !! 1) @?= 5
+          prResponseErrorCode (parts !! 2) @?= 0
+        Nothing -> assertFailure "parse v9 failed"
+  ]
+
 fetchResponseTest :: TestTree
 fetchResponseTest = testGroup "Fetch"
   [ goldenVsString
       "Many batches"
       "test/golden/fetch-response-parsed"
       (do
-        bytes <- readFile "test/golden/fetch-response-bytes"
-        case Smith.parseByteArray Fetch.parseFetchResponse (S.toByteArray bytes) of
-          Failure e -> fail ("Parse failed with " <> e)
-          Success (Smith.Slice _ _ res) -> pure (BL.fromStrict (BC8.pack (show res)))
+        rawBytes <- B.readFile "test/golden/fetch-response-bytes"
+        case runWire Fetch.parseFetchResponse rawBytes of
+          Nothing -> fail "Parse failed"
+          Just res -> pure (BL.fromStrict (BC8.pack (show res)))
       )
   ]
 

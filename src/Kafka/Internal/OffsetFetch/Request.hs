@@ -1,11 +1,12 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Kafka.Internal.OffsetFetch.Request where
 
-import Data.Primitive.Unlifted.Array
+import qualified Data.ByteString.Lazy as BSL
+import Data.Int (Int16, Int32)
 
 import Kafka.Common
 import Kafka.Internal.Writer
-
-import qualified String.Ascii as S
 
 offsetFetchApiKey :: Int16
 offsetFetchApiKey = 9
@@ -17,24 +18,15 @@ offsetFetchRequest ::
      GroupMember
   -> TopicName
   -> [Int32]
-  -> UnliftedArray ByteArray
+  -> BSL.ByteString
 offsetFetchRequest (GroupMember (GroupName gid) _) tn offs =
-  let
-    reqSize = build (int32 (size32 req))
-    req =
-      build $
-        int16 offsetFetchApiKey
-        <> int16 offsetFetchApiVersion
-        <> int32 correlationId
-        <> string clientId clientIdLength
-        <> string gid (S.length gid)
-        <> int32 1 -- 1 topic
-        <> topicName tn
-        <> int32 (fromIntegral (length offs))
-        <> foldMap int32 offs
-  in
-    runUnliftedArray $ do
-      arr <- newUnliftedArray 2 mempty
-      writeUnliftedArray arr 0 reqSize
-      writeUnliftedArray arr 1 req
-      pure arr
+  buildRequest $
+    int16 offsetFetchApiKey
+    <> int16 offsetFetchApiVersion
+    <> int32 correlationId
+    <> string clientId
+    <> string gid
+    <> int32 1 -- 1 topic
+    <> topicName tn
+    <> int32 (fromIntegral (length offs))
+    <> foldMap int32 offs

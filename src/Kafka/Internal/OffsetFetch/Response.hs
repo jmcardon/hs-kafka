@@ -1,18 +1,15 @@
-{-# language
-    BangPatterns
-  #-}
-
 module Kafka.Internal.OffsetFetch.Response
   ( OffsetFetchResponse(..)
   , OffsetFetchTopic(..)
   , OffsetFetchPartition(..)
-  , getOffsetFetchResponse
   , parseOffsetFetchResponse
   ) where
 
-import Kafka.Internal.Combinator
-import Kafka.Common
-import Kafka.Internal.Response
+import Data.ByteString (ByteString)
+import Data.Int (Int16, Int32, Int64)
+
+import Kafka.Common (TopicName(..))
+import Kafka.Internal.Wire
 
 data OffsetFetchResponse = OffsetFetchResponse
   { throttleTimeMs :: {-# UNPACK #-} !Int32
@@ -29,34 +26,27 @@ data OffsetFetchPartition = OffsetFetchPartition
   { partitionIndex :: {-# UNPACK #-} !Int32
   , offset :: {-# UNPACK #-} !Int64
   , leaderEpoch :: {-# UNPACK #-} !Int32
-  , metadata :: !(Maybe ByteArray)
+  , metadata :: !(Maybe ByteString)
   , partitionErrorCode :: {-# UNPACK #-} !Int16
   } deriving (Eq, Show)
 
-parseOffsetFetchResponse :: Parser OffsetFetchResponse
+parseOffsetFetchResponse :: Wire OffsetFetchResponse
 parseOffsetFetchResponse = do
-  _correlationId <- int32 "correlation id"
+  _correlationId <- int32
   OffsetFetchResponse
-    <$> (int32 "throttle time")
-    <*> (array parseOffsetFetchTopic <?> "topics")
-    <*> (int16 "error code")
+    <$> int32
+    <*> legacyArray parseOffsetFetchTopic
+    <*> int16
 
-parseOffsetFetchTopic :: Parser OffsetFetchTopic
+parseOffsetFetchTopic :: Wire OffsetFetchTopic
 parseOffsetFetchTopic = OffsetFetchTopic
-  <$> (topicName <?> "topic name")
-  <*> (array parseOffsetFetchPartitions <?> "partitions")
+  <$> (TopicName <$> legacyString)
+  <*> legacyArray parseOffsetFetchPartition
+{-# INLINE parseOffsetFetchTopic #-}
 
-parseOffsetFetchPartitions :: Parser OffsetFetchPartition
-parseOffsetFetchPartitions = OffsetFetchPartition
-  <$> (int32 "partition id")
-  <*> (int64 "offset")
-  <*> (int32 "leader epoch")
-  <*> (nullableByteArray <?> "metadata")
-  <*> (int16 "error code")
-
-getOffsetFetchResponse ::
-     Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String OffsetFetchResponse))
-getOffsetFetchResponse = fromKafkaResponse parseOffsetFetchResponse
+parseOffsetFetchPartition :: Wire OffsetFetchPartition
+parseOffsetFetchPartition = OffsetFetchPartition
+  <$> int32 <*> int64 <*> int32
+  <*> legacyNullableString
+  <*> int16
+{-# INLINE parseOffsetFetchPartition #-}

@@ -30,14 +30,19 @@ module Kafka.Consumer
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
 import Control.Monad hiding (join)
-import Control.Monad.Except hiding (join)
-import Control.Monad.Reader hiding (join)
+import Control.Monad.Except
+import Control.Monad.Reader
+import Data.Coerce (coerce)
 import Data.Foldable
+import Data.Int (Int16, Int32, Int64)
 import Data.IntMap (IntMap)
 import qualified Data.List as List
 import Data.Maybe
-import Socket.Stream.IPv4 (Peer)
+import Network.Socket (HostName, ServiceName)
+import System.IO (Handle)
 
 import qualified Data.IntMap as IM
 
@@ -45,12 +50,11 @@ import Kafka.Common
 import Kafka.Internal.Request
 import Kafka.Internal.Request.Types
 import Kafka.Internal.Fetch.Response
-import Kafka.Internal.JoinGroup.Response (Member, getJoinGroupResponse)
-import Kafka.Internal.FindCoordinator.Response (getFindCoordinatorResponse)
-import Kafka.Internal.LeaveGroup.Response (getLeaveGroupResponse)
-import Kafka.Internal.Heartbeat.Response (getHeartbeatResponse)
+import Kafka.Internal.JoinGroup.Response (Member)
+import Kafka.Internal.FindCoordinator.Response (parseFindCoordinatorResponse)
 import Kafka.Internal.ListOffsets.Response (ListOffsetsResponse)
 import Kafka.Internal.SyncGroup.Response (SyncTopicAssignment)
+import Kafka.Internal.Response (parseResponse)
 import Kafka.Internal.Topic
 
 import qualified Kafka.Internal.LeaveGroup.Response as LeaveGroup
@@ -62,7 +66,11 @@ import qualified Kafka.Internal.OffsetCommit.Response as C
 import qualified Kafka.Internal.OffsetFetch.Response as O
 import qualified Kafka.Internal.SyncGroup.Response as S
 
-import qualified String.Ascii as Str
+-- | Whether or not consumption has been interrupted.
+data Interruptedness
+  = Interrupted
+  | Uninterrupted
+  deriving (Eq, Show)
 
 -- | This module provides a high-level interface to the Kafka API for
 -- consumers by wrapping the low-level request and response type modules.
@@ -78,12 +86,6 @@ newtype Consumer a
     , MonadError KafkaException
     , MonadReader (TVar ConsumerState)
     )
-
-tryParse :: Either KafkaException (Either String a) -> Either KafkaException a
-tryParse = \case
-  Right (Right parsed) -> Right parsed
-  Right (Left parseError) -> Left (KafkaParseException parseError)
-  Left networkError -> Left networkError
 
 instance MonadIO Consumer where
   liftIO = Consumer . liftIO
@@ -170,9 +172,7 @@ getListedOffsets allIndices = do
   ConsumerState {..} <- getv
   let ConsumerSettings {..} = settings
   liftConsumer $ listOffsets kafka (ListOffsetsRequest csTopicName allIndices groupFetchStart) handle
-  listOffsetsTimeout <- liftIO (registerDelay timeout)
-  listedOffs <- liftConsumer $ tryParse <$>
-    L.getListOffsetsResponse kafka listOffsetsTimeout handle
+  listedOffs <- liftConsumer $ parseResponse L.parseListOffsetsResponse kafka timeout
   let lots = L.topics listedOffs
   let errs = case List.find ((== csTopicName) . L.topic) lots of
         Nothing -> []
@@ -189,7 +189,6 @@ getListedOffsets allIndices = do
 initializeOffsets :: [Int32] -> Consumer ()
 initializeOffsets assignedPartitions = do
   ConsumerState {..} <- getv
-  let ConsumerSettings {..} = settings
   withSocket sock $ do
     initialOffs <- getListedOffsets assignedPartitions
     latestOffs <- latestOffsets assignedPartitions
@@ -218,12 +217,13 @@ updateOffsets name current r =
     current
 
 withConsumer :: ()
-  => Peer
+  => HostName
+  -> ServiceName
   -> ConsumerSettings
   -> (TVar ConsumerState -> IO a)
   -> IO (Either KafkaException a)
-withConsumer peer settings f = do
-  r <- withKafka peer $ \k -> do
+withConsumer host port settings f = do
+  r <- withKafka host port $ \k -> do
     r <- newConsumer k settings
     case r of
       Left e -> pure (Left e)
@@ -301,8 +301,7 @@ sendHeartbeat = do
   ConsumerState {sock, member, genId, kafka, settings} <- getv
   withSocket sock $ do
     liftConsumer $ heartbeat kafka (HeartbeatRequest member genId) (handle settings)
-    timeout <- liftIO $ registerDelay (timeout settings)
-    resp <- liftConsumer $ tryParse <$> getHeartbeatResponse kafka timeout (handle settings)
+    resp <- liftConsumer $ parseResponse H.parseHeartbeatResponse kafka (timeout settings)
     case fromErrorCode (H.errorCode resp) of
       Nothing -> pure ()
       Just None -> pure ()
@@ -314,8 +313,7 @@ leave = do
   ConsumerState {..} <- getv
   withSocket sock $ do
     liftConsumer $ leaveGroup kafka (LeaveGroupRequest member) (handle settings)
-    timeout <- liftIO $ registerDelay (timeout settings)
-    resp <- liftConsumer $ tryParse <$> getLeaveGroupResponse kafka timeout (handle settings)
+    resp <- liftConsumer $ parseResponse LeaveGroup.parseLeaveGroupResponse kafka (timeout settings)
     case fromErrorCode (LeaveGroup.errorCode resp) of
       Nothing -> modifyv (\s -> s { quit = Interrupted })
       Just None -> modifyv (\s -> s { quit = Interrupted })
@@ -333,8 +331,7 @@ getRecordSet fetchWaitTime = do
       kafka
       (FetchRequest csTopicName fetchWaitTime offsetList maxFetchBytes)
       handle
-    interrupt <- liftIO $ registerDelay timeout
-    fetchResp <- liftConsumer $ tryParse <$> getFetchResponse kafka interrupt handle
+    fetchResp <- liftConsumer $ parseResponse F.parseFetchResponse kafka timeout
     let errs = fetchResponseErrors fetchResp
     let newOffsets = updateOffsets csTopicName offsets fetchResp
     modifyv (\s -> s { offsets = newOffsets })
@@ -353,9 +350,7 @@ jumpToLatestOffset index = do
   ConsumerState {..} <- getv
   let ConsumerSettings {..} = settings
   liftConsumer $ listOffsets kafka (ListOffsetsRequest csTopicName [index] Latest) handle
-  listOffsetsTimeout <- liftIO (registerDelay timeout)
-  resp <- liftConsumer $ tryParse <$>
-    L.getListOffsetsResponse kafka listOffsetsTimeout handle
+  resp <- liftConsumer $ parseResponse L.parseListOffsetsResponse kafka timeout
   let listedOffs = listOffsetsMap resp
   -- Right biased union, because we want to jump to the offset in the right map
   modifyv (\s -> s { offsets = IM.unionWith (\_ y -> y) offsets listedOffs })
@@ -407,8 +402,7 @@ latestOffsets indices = do
     kafka
     (OffsetFetchRequest (csTopicName settings) member indices)
     (handle settings)
-  timeout <- liftIO $ registerDelay (timeout settings)
-  offs <- liftConsumer $ tryParse <$> O.getOffsetFetchResponse kafka timeout (handle settings)
+  offs <- liftConsumer $ parseResponse O.parseOffsetFetchResponse kafka (timeout settings)
   case fromErrorCode (O.errorCode offs) of
     Nothing -> pure (offsetFetchOffsets offs)
     Just None -> pure (offsetFetchOffsets offs)
@@ -427,8 +421,7 @@ commitOffsets' cs = do
     kafka
     (OffsetCommitRequest csTopicName (toOffsetList offsets) member genId)
     handle
-  timeoutV <- liftIO $ registerDelay timeout
-  resp <- liftConsumer $ tryParse <$> C.getOffsetCommitResponse kafka timeoutV handle
+  resp <- liftConsumer $ parseResponse C.parseOffsetCommitResponse kafka timeout
   let tops = C.topics resp
   let errs = case List.find ((== csTopicName) . C.topic) tops of
         Nothing -> []
@@ -509,8 +502,7 @@ sync kafka topicName partitionCount member members genId handle = do
     kafka
     (SyncGroupRequest member genId assignments)
     handle
-  wait <- liftIO (registerDelay joinTimeout)
-  sgr <- ExceptT $ tryParse <$> S.getSyncGroupResponse kafka wait handle
+  sgr <- ExceptT $ parseResponse S.parseSyncGroupResponse kafka joinTimeout
   if S.errorCode sgr `elem` expectedSyncErrors then do
     (newGenId, newMember, newMembers) <- join kafka topicName member handle
     sync kafka topicName partitionCount newMember newMembers newGenId handle
@@ -529,17 +521,16 @@ join ::
 join kafka top member@(GroupMember name@(GroupName gid) _) handle = do
   ExceptT $ findCoordinator
     kafka
-    (FindCoordinatorRequest (Str.toByteArray gid) 0)
+    (FindCoordinatorRequest gid 0)
     handle
-  wait <- liftIO (registerDelay joinTimeout)
   -- Ignoring the response from FindCoordinator. Probably not
   -- a good idea.
-  _ <- ExceptT $ tryParse <$> getFindCoordinatorResponse kafka wait handle
+  _ <- ExceptT $ parseResponse parseFindCoordinatorResponse kafka joinTimeout
   ExceptT $ joinGroup
     kafka
     (JoinGroupRequest top member)
     handle
-  jgr <- ExceptT $ tryParse <$> getJoinGroupResponse kafka wait handle
+  jgr <- ExceptT $ parseResponse J.parseJoinGroupResponse kafka joinTimeout
   let no_error_join = do
         let genId = GenerationId (J.generationId jgr)
         let memId = Just (J.memberId jgr)

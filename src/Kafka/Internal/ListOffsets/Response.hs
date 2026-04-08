@@ -1,15 +1,14 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 module Kafka.Internal.ListOffsets.Response
   ( ListOffsetsResponse(..)
   , ListOffsetsTopic(..)
   , ListOffsetPartition(..)
-  , getListOffsetsResponse
+  , parseListOffsetsResponse
   ) where
 
-import Kafka.Internal.Combinator
-import Kafka.Common
-import Kafka.Internal.Response
+import Data.Int (Int16, Int32, Int64)
+
+import Kafka.Common (TopicName(..))
+import Kafka.Internal.Wire
 
 data ListOffsetsResponse = ListOffsetsResponse
   { throttleTimeMs :: {-# UNPACK #-} !Int32
@@ -29,29 +28,20 @@ data ListOffsetPartition = ListOffsetPartition
   , leaderEpoch :: {-# UNPACK #-} !Int32
   } deriving (Eq, Show)
 
-parseListOffsetsResponse :: Parser ListOffsetsResponse
+parseListOffsetsResponse :: Wire ListOffsetsResponse
 parseListOffsetsResponse = do
-  _correlationId <- int32 "correlation id"
+  _correlationId <- int32
   ListOffsetsResponse
-    <$> int32 "throttleTimeMs"
-    <*> (array parseListOffsetsTopic <?> "list offsets: topic name")
+    <$> int32
+    <*> legacyArray parseListOffsetsTopic
 
-parseListOffsetsTopic :: Parser ListOffsetsTopic
+parseListOffsetsTopic :: Wire ListOffsetsTopic
 parseListOffsetsTopic = ListOffsetsTopic
-  <$> topicName
-  <*> array parseListOffsetPartition
+  <$> (TopicName <$> legacyString)
+  <*> legacyArray parseListOffsetPartition
+{-# INLINE parseListOffsetsTopic #-}
 
-parseListOffsetPartition :: Parser ListOffsetPartition
+parseListOffsetPartition :: Wire ListOffsetPartition
 parseListOffsetPartition = ListOffsetPartition
-  <$> int32 "partition"
-  <*> int16 "error code"
-  <*> int64 "timestamp"
-  <*> int64 "offset"
-  <*> int32 "leader epoch"
-
-getListOffsetsResponse ::
-     Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String ListOffsetsResponse))
-getListOffsetsResponse = fromKafkaResponse parseListOffsetsResponse
+  <$> int32 <*> int16 <*> int64 <*> int64 <*> int32
+{-# INLINE parseListOffsetPartition #-}

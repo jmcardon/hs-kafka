@@ -1,54 +1,37 @@
-{-# language
-    BangPatterns
-  , OverloadedStrings
-  #-}
-
 module Kafka.Internal.JoinGroup.Response
   ( JoinGroupResponse(..)
   , Member(..)
-  , getJoinGroupResponse
   , parseJoinGroupResponse
   ) where
 
-import Kafka.Common
-import Kafka.Internal.Combinator
-import Kafka.Internal.Response
+import Data.ByteString (ByteString)
+import Data.Int (Int16, Int32)
+
+import Kafka.Internal.Wire
 
 data JoinGroupResponse = JoinGroupResponse
   { throttleTimeMs :: {-# UNPACK #-} !Int32
   , errorCode :: {-# UNPACK #-} !Int16
   , generationId :: {-# UNPACK #-} !Int32
-  , groupProtocol :: {-# UNPACK #-} !ByteArray
-  , leaderId :: {-# UNPACK #-} !ByteArray
-  , memberId :: {-# UNPACK #-} !ByteArray
+  , groupProtocol :: !ByteString
+  , leaderId :: !ByteString
+  , memberId :: !ByteString
   , members :: [Member]
   } deriving (Eq, Show)
 
 data Member = Member
-  { groupMemberId :: {-# UNPACK #-} !ByteArray
-  , groupMemberMetadata :: {-# UNPACK #-} !ByteArray
+  { groupMemberId :: !ByteString
+  , groupMemberMetadata :: !ByteString
   } deriving (Eq, Show)
 
-parseJoinGroupResponse :: Parser JoinGroupResponse
+parseJoinGroupResponse :: Wire JoinGroupResponse
 parseJoinGroupResponse = do
-  _correlationId <- int32 "correlation id"
+  _correlationId <- int32
   JoinGroupResponse
-    <$> (int32 "throttle time")
-    <*> (int16 "error code")
-    <*> (int32 "generation id")
-    <*> (bytearray <?> "group protocol")
-    <*> (bytearray <?> "leader id")
-    <*> (bytearray <?> "member id")
-    <*> (array parseMember <?> "members")
+    <$> int32 <*> int16 <*> int32
+    <*> legacyString <*> legacyString <*> legacyString
+    <*> legacyArray parseMember
 
-parseMember :: Parser Member
-parseMember = Member
-  <$> (bytearray <?> "member id")
-  <*> (sizedBytes <?> "member metadata")
-
-getJoinGroupResponse ::
-     Kafka
-  -> TVar Bool
-  -> Maybe Handle
-  -> IO (Either KafkaException (Either String JoinGroupResponse))
-getJoinGroupResponse = fromKafkaResponse parseJoinGroupResponse
+parseMember :: Wire Member
+parseMember = Member <$> legacyString <*> legacySizedBytes
+{-# INLINE parseMember #-}

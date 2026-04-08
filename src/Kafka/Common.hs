@@ -1,25 +1,21 @@
 {-# language
     BangPatterns
-  , DataKinds
   , DerivingStrategies
   , GeneralizedNewtypeDeriving
-  , GADTs
   , LambdaCase
   , OverloadedStrings
   , ScopedTypeVariables
-  , StandaloneDeriving
-  , ViewPatterns
   #-}
 
 module Kafka.Common
   ( Kafka(..)
   , withKafka
+  , connectBroker
   , Topic(..)
   , TopicName(..)
   , getTopicName
   , PartitionOffset(..)
   , TopicAssignment(..)
-  , Interruptedness(..)
   , KafkaTimestamp(..)
   , AutoCreateTopic(..)
   , KafkaException(..)
@@ -31,16 +27,21 @@ module Kafka.Common
   , FetchErrorMessage(..)
   , OffsetCommitErrorMessage(..)
   , fromErrorCode
+  , isRetriable
   , clientId
   , clientIdLength
   , correlationId
   ) where
 
-import Socket.Stream.IPv4
+import Control.Exception (Exception, bracket, try, IOException)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import Data.Int (Int16, Int32, Int64)
+import Data.IORef (IORef)
+import Data.String (IsString)
+import Network.Socket
 
-import qualified String.Ascii as S
-
-newtype Kafka = Kafka { getKafka :: Connection }
+newtype Kafka = Kafka { getSocket :: Socket }
 
 instance Show Kafka where
   show _ = "<Kafka>"
@@ -50,7 +51,7 @@ data Topic = Topic
   {-# UNPACK #-} !Int -- Number of partitions
   {-# UNPACK #-} !(IORef Int) -- incrementing number
 
-newtype TopicName = TopicName S.String
+newtype TopicName = TopicName ByteString
   deriving newtype (Eq, Ord, Show, IsString)
 
 getTopicName :: Topic -> TopicName
@@ -72,42 +73,21 @@ data AutoCreateTopic
   | NeverCreate
   deriving (Show)
 
-data KafkaException where
-  KafkaSendException :: ()
-    => SendException 'Uninterruptible
-    -> KafkaException
-  KafkaReceiveException :: ()
-    => ReceiveException 'Interruptible
-    -> KafkaException
-  KafkaCloseException :: ()
-    => CloseException
-    -> KafkaException
-  KafkaParseException :: ()
-    => String
-    -> KafkaException
-  KafkaUnexpectedErrorCodeException :: ()
-    => !Int16
-    -> KafkaException
-  KafkaConnectException :: ()
-    => ConnectException ('Internet 'V4) 'Uninterruptible
-    -> KafkaException
-  KafkaException :: ()
-    => String
-    -> KafkaException
-  KafkaOffsetCommitException :: ()
-    => [OffsetCommitErrorMessage]
-    -> KafkaException
---  KafkaProduceException :: ()
---    => !Int16
---    -> KafkaException
-  KafkaFetchException :: ()
-    => [FetchErrorMessage]
-    -> KafkaException
-  KafkaProtocolException :: ()
-    => !KafkaProtocolError
-    -> KafkaException
+data KafkaException
+  = KafkaIOError !String
+  | KafkaParseException !String
+  | KafkaProtocolException !KafkaProtocolError
+  | KafkaException !String
+  | KafkaOffsetCommitException ![OffsetCommitErrorMessage]
+  | KafkaFetchException ![FetchErrorMessage]
+  | KafkaUnexpectedErrorCodeException !Int16
+  | KafkaQueueFullException
+    -- ^ The broker's outbound queue is full (backpressure).
+    -- Matches librdkafka's RD_KAFKA_RESP_ERR__QUEUE_FULL.
+    -- Returned as a value in Either, never thrown.
+  deriving (Show)
 
-deriving stock instance Show KafkaException
+instance Exception KafkaException
 
 data OffsetCommitErrorMessage = OffsetCommitErrorMessage
   { commitErrorTopic :: {-# UNPACK #-} !TopicName
@@ -123,12 +103,12 @@ data FetchErrorMessage = FetchErrorMessage
 
 data GroupMember = GroupMember
   { groupName :: !GroupName
-  , memberId :: !(Maybe ByteArray)
+  , memberId :: !(Maybe ByteString)
   }
   deriving (Eq, Show)
 
 newtype GroupName = GroupName
-  { getGroupName :: S.String
+  { getGroupName :: ByteString
   } deriving (Eq, Show, IsString)
 
 newtype GenerationId = GenerationId
@@ -136,7 +116,7 @@ newtype GenerationId = GenerationId
   } deriving (Eq, Show)
 
 data MemberAssignment = MemberAssignment
-  { assignedMemberId :: {-# UNPACK #-} !ByteArray
+  { assignedMemberId :: !ByteString
   , assignedTopics :: [TopicAssignment]
   } deriving (Eq, Show)
 
@@ -145,31 +125,29 @@ data TopicAssignment = TopicAssignment
   , assignedPartitions :: [Int32]
   } deriving (Eq, Show)
 
-data Interruptedness = Interrupted | Uninterrupted
-  deriving (Eq, Show)
+withKafka :: HostName -> ServiceName -> (Kafka -> IO a) -> IO (Either KafkaException a)
+withKafka host port f = do
+  result <- try $ bracket (connectBroker host port) close $ \sock ->
+    f (Kafka sock)
+  case result of
+    Left (e :: IOException) -> pure (Left (KafkaIOError (show e)))
+    Right a -> pure (Right a)
 
-withKafka :: ()
-  => Peer
-  -> (Kafka -> IO a)
-  -> IO (Either KafkaException a)
-withKafka peer f = do
-  r <- withConnection
-    peer
-    (\e a -> case e of
-      Left c -> pure (Left (KafkaCloseException c))
-      Right () -> pure a
-    )
-    (\(Kafka -> conn) -> fmap Right (f conn)
-    )
-  case r of
-    Left e -> pure (Left (KafkaConnectException e))
-    Right x -> pure x
+connectBroker :: HostName -> ServiceName -> IO Socket
+connectBroker host port = do
+  let hints = defaultHints { addrSocketType = Stream }
+  addr:_ <- getAddrInfo (Just hints) (Just host) (Just port)
+  sock <- openSocket addr
+  setSocketOption sock NoDelay 1
+  setSocketOption sock KeepAlive 1
+  connect sock (addrAddress addr)
+  pure sock
 
-clientId :: S.String
-clientId = "ruko"
+clientId :: ByteString
+clientId = "kafka-native"
 
 clientIdLength :: Int
-clientIdLength = S.length clientId
+clientIdLength = BS.length clientId
 
 correlationId :: Int32
 correlationId = 0xbeef
@@ -844,3 +822,29 @@ fromErrorCode = \case
   81   -> Just GroupMaxSizeReached
   82   -> Just FencedInstanceId
   _    -> Nothing
+
+-- | Whether a Kafka protocol error is retriable.
+-- Matches librdkafka's retriable error classification.
+isRetriable :: KafkaProtocolError -> Bool
+isRetriable = \case
+  CorruptMessage             -> True
+  UnknownTopicOrPartition    -> True
+  LeaderNotAvailable         -> True
+  NotLeaderForPartition      -> True
+  RequestTimedOut            -> True
+  NetworkException           -> True
+  CoordinatorLoadInProgress  -> True
+  CoordinatorNotAvailable    -> True
+  NotCoordinator             -> True
+  NotEnoughReplicas          -> True
+  NotEnoughReplicasAfterAppend -> True
+  NotController              -> True
+  KafkaStorageError          -> True
+  FetchSessionIdNotFound     -> True
+  InvalidFetchSessionEpoch   -> True
+  ListenerNotFound           -> True
+  FencedLeaderEpoch          -> True
+  UnknownLeaderEpoch         -> True
+  OffsetNotAvailable         -> True
+  PreferredLeaderNotAvailable -> True
+  _                          -> False

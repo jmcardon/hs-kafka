@@ -1,96 +1,496 @@
 {-# language
     BangPatterns
   , LambdaCase
+  , OverloadedStrings
   #-}
 
+-- | High-performance Kafka producer with delivery reports.
+--
+-- Delivery report model (matching librdkafka):
+--
+-- * Broker thread produces → gets ProduceResponse → pushes
+--   'DeliveryEntry' items to a 'TBQueue'. Never invokes callbacks.
+--
+-- * Application thread calls 'pollEvents' → drains the queue,
+--   invokes per-message and global callbacks, returns reports.
+--
+-- This means: produce in thread A, poll in thread B. The broker
+-- thread is never blocked by user callback code.
+--
+-- Queue forwarding: call 'forwardDeliveryQueue' to route delivery
+-- reports to a custom queue instead of the default one.
 module Kafka.Producer
-  ( Producer(..)
+  ( -- * Producer handle
+    KafkaProducer(..)
+  , ProducerConfig(..)
+  , defaultProducerConfig
+    -- * Lifecycle
+  , newProducer
+  , closeProducer
   , withProducer
+  , flushProducer
+  , flush
+  , FlushResult(..)
+  , drainDeliveryReports
+  , rotatePartitions
+  , outboundQueueLength
+    -- * Producing
   , produce
+  , produceAsync
+  , produceWithCallback
+    -- * Delivery reports
+  , pollEvents
+    -- * Queue forwarding
+  , forwardDeliveryQueue
+  , newDeliveryQueue
+    -- * Types (re-export)
+  , module Kafka.Producer.Types
   ) where
 
-import Data.Primitive.Unlifted.Array
-import Socket.Stream.IPv4 (Peer)
+import Control.Concurrent.MVar (MVar, newMVar, modifyMVar, readMVar)
+import Control.Exception (mask, onException)
+import Control.Monad (void, forM_)
+import Data.Foldable (traverse_)
+import GHC.Clock (getMonotonicTimeNSec)
+import Control.Concurrent.STM
+import Data.Int (Int32, Int64, Int16)
+import Data.IORef (IORef, newIORef, readIORef, atomicModifyIORef')
+import Data.Map.Strict (Map)
+import Numeric.Natural (Natural)
 
+import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as Map
-import qualified Data.Primitive.Contiguous as C
 
 import Kafka.Common
-import Kafka.Internal.Produce.Response
-import Kafka.Internal.Request.Types
-import Kafka.Internal.Topic (makeTopic)
+import Kafka.Client
+import Kafka.Internal.Broker
+import Kafka.Internal.Config
+import Kafka.Internal.InitProducerId.Request (initProducerIdRequest)
+import Kafka.Internal.InitProducerId.Response (InitProducerIdResponse(..),
+  parseInitProducerIdResponseV4)
+import Kafka.Internal.Murmur2 (murmur2)
+import Kafka.Producer.Types
+import qualified Kafka.Internal.Wire as Wire
 
-import qualified Kafka.Internal.Request as Request
+------------------------------------------------------------------------
+-- Configuration
+------------------------------------------------------------------------
 
-data Producer = Producer
-  { producerKafka :: !Kafka
-    -- ^ Connection to Kafka
-  , producerTopics :: !(IORef (Map.Map TopicName Topic))
-    -- ^ TopicName with associated Topic
-  , producerTimeout :: !Int
-    -- ^ Timeout in microseconds
-  , producerDebugHandle :: !(Maybe Handle)
-    -- ^ File handle for debug output
+data ProducerConfig = ProducerConfig
+  { pcClientConfig     :: !ClientConfig
+  , pcDeliveryCallback :: !(Maybe (DeliveryReport -> IO ()))
+    -- ^ Global delivery report callback. Invoked by 'pollEvents'
+    -- in the polling thread (NOT the broker thread).
+  , pcDeliveryQueueSize :: {-# UNPACK #-} !Int
+    -- ^ Size of the delivery report queue. Default: 10000.
   }
 
-withProducer :: ()
-  => Peer
-  -> Int
-  -> Maybe Handle
-  -> (Producer -> IO a)
-  -> IO (Either KafkaException a)
-withProducer peer timeout h f = withKafka peer $ \k -> do
-  topics <- newIORef mempty
-  let producer = Producer k topics timeout h
-  f producer
+defaultProducerConfig :: ClientConfig -> ProducerConfig
+defaultProducerConfig cfg = ProducerConfig
+  { pcClientConfig = cfg
+  , pcDeliveryCallback = Nothing
+  , pcDeliveryQueueSize = 10000
+  }
 
-produce' ::
-     Producer
-  -> Topic
-  -> UnliftedArray ByteArray
-  -> IO (Either KafkaException ())
-produce' (Producer k _ timeout handle) topic msgs =
-  if C.size msgs > 0
+------------------------------------------------------------------------
+-- Producer handle
+------------------------------------------------------------------------
+
+data KafkaProducer = KafkaProducer
+  { kpClient           :: !KafkaClient
+  , kpCounters         :: !(MVar (Map TopicName (IORef Int)))
+  , kpConfig           :: !ClientConfig
+  , kpIdempotent       :: !(Maybe IdempotentState)
+  , kpDeliveryQueue    :: !(TBQueue DeliveryEntry)
+    -- ^ Default delivery queue. Broker threads push here.
+  , kpForwardQueue     :: !(TVar (Maybe (TBQueue DeliveryEntry)))
+    -- ^ If set, new messages use this queue instead of kpDeliveryQueue.
+    -- Enables queue forwarding (like librdkafka's rkq_fwdq).
+  , kpGlobalCallback   :: !(Maybe (DeliveryReport -> IO ()))
+    -- ^ Global callback, invoked by pollEvents.
+  }
+
+data IdempotentState = IdempotentState
+  { isProducerId    :: {-# UNPACK #-} !Int64
+  , isProducerEpoch :: {-# UNPACK #-} !Int16
+  , isSequences     :: !(MVar (Map (TopicName, Int32) Int32))
+  }
+
+------------------------------------------------------------------------
+-- Lifecycle
+------------------------------------------------------------------------
+
+newProducer :: KafkaClient -> ProducerConfig -> IO (Either KafkaException KafkaProducer)
+newProducer client pCfg = do
+  let cfg = pcClientConfig pCfg
+  counters <- newMVar Map.empty
+  drQueue <- newTBQueueIO (fromIntegral (pcDeliveryQueueSize pCfg) :: Natural)
+  fwdVar <- newTVarIO Nothing
+  if ccIdempotent cfg
     then do
-      let req = ProduceRequest topic timeout msgs
-      status <- Request.produce k req handle
-      case status of
+      idempResult <- initIdempotentState client
+      case idempResult of
+        Left err -> pure (Left err)
+        Right idemState -> do
+          brokers <- readTVarIO (kcBrokers client)
+          mapM_ (\env -> setIdempotentState env
+            (isProducerId idemState) (isProducerEpoch idemState) (isSequences idemState))
+            (IM.elems brokers)
+          pure $ Right KafkaProducer
+            { kpClient = client, kpCounters = counters, kpConfig = cfg
+            , kpIdempotent = Just idemState, kpDeliveryQueue = drQueue
+            , kpForwardQueue = fwdVar, kpGlobalCallback = pcDeliveryCallback pCfg }
+    else pure $ Right KafkaProducer
+      { kpClient = client, kpCounters = counters, kpConfig = cfg
+      , kpIdempotent = Nothing, kpDeliveryQueue = drQueue
+      , kpForwardQueue = fwdVar, kpGlobalCallback = pcDeliveryCallback pCfg }
+
+initIdempotentState :: KafkaClient -> IO (Either KafkaException IdempotentState)
+initIdempotentState client = do
+  mBroker <- anyBroker client
+  case mBroker of
+    Nothing -> pure (Left (KafkaException "no broker available for InitProducerId"))
+    Just env -> do
+      let reqBytes = initProducerIdRequest Nothing 30000
+      respVar <- enqueueRequest env reqBytes
+      response <- atomically $ readTMVar respVar
+      case response of
+        Left err -> pure (Left err)
+        Right bytes -> case Wire.runWire parseInitProducerIdResponseV4 bytes of
+          Nothing -> pure (Left (KafkaParseException "failed to parse InitProducerIdResponse"))
+          Just resp
+            | ipErrorCode resp /= 0 ->
+                pure (Left (KafkaUnexpectedErrorCodeException (ipErrorCode resp)))
+            | otherwise -> do
+                seqs <- newMVar Map.empty
+                pure $ Right IdempotentState
+                  { isProducerId = ipProducerId resp
+                  , isProducerEpoch = ipProducerEpoch resp
+                  , isSequences = seqs }
+
+-- | Bracket-based producer lifecycle. Flushes and closes on exit/exception.
+withProducer :: KafkaClient -> ProducerConfig
+            -> (KafkaProducer -> IO a) -> IO (Either KafkaException a)
+withProducer client cfg action = mask $ \restore -> do
+  result <- newProducer client cfg
+  case result of
+    Left err -> pure (Left err)
+    Right producer -> do
+      let cleanup = closeProducer producer
+      a <- restore (action producer) `onException` cleanup
+      cleanup
+      pure (Right a)
+
+-- | Close the producer. Currently a no-op since broker threads are
+-- owned by KafkaClient. Call closeClient to shut everything down.
+-- | Close the producer. Flushes all pending messages before returning,
+-- matching librdkafka's closeProducer = flushProducer semantics.
+closeProducer :: KafkaProducer -> IO ()
+closeProducer = flushProducer
+
+------------------------------------------------------------------------
+-- Queue forwarding
+------------------------------------------------------------------------
+
+-- | Create a new delivery queue that can be used with 'forwardDeliveryQueue'.
+newDeliveryQueue :: Int -> IO (TBQueue DeliveryEntry)
+newDeliveryQueue size = newTBQueueIO (fromIntegral size :: Natural)
+
+-- | Forward delivery reports to a custom queue. New messages produced
+-- after this call will have their delivery reports sent to @q@ instead
+-- of the producer's default queue. Pass 'Nothing' to revert to default.
+--
+-- This is like librdkafka's @rd_kafka_queue_forward()@.
+forwardDeliveryQueue :: KafkaProducer -> Maybe (TBQueue DeliveryEntry) -> IO ()
+forwardDeliveryQueue producer mq =
+  atomically $ writeTVar (kpForwardQueue producer) mq
+
+------------------------------------------------------------------------
+-- Producing
+------------------------------------------------------------------------
+
+-- | Produce a message synchronously. Blocks until the broker confirms
+-- delivery. Does NOT require a separate polling thread — the broker
+-- thread writes the result directly to a TMVar (lightweight STM write,
+-- not a user callback).
+produce :: KafkaProducer -> ProducerRecord -> IO (Either KafkaException DeliveryReport)
+produce producer record = do
+  var <- newEmptyTMVarIO
+  -- Use a callback that just fills the TMVar. This callback is stored
+  -- in DeliveryEntry and invoked by pollEvents OR read directly by the
+  -- broker thread via the TMVar mechanism below. For sync produce, we
+  -- also install it as a direct STM write so it works without polling.
+  result <- sendRecordSync producer record var
+  case result of
+    Left err -> pure (Left err)
+    Right () -> Right <$> atomically (readTMVar var)
+
+-- | Produce asynchronously. Returns immediately.
+-- Delivery reports available via 'pollEvents'.
+produceAsync :: KafkaProducer -> ProducerRecord -> IO (Either KafkaException ())
+produceAsync producer record =
+  sendRecord producer record Nothing
+
+-- | Produce with a per-message callback. The callback is invoked
+-- by 'pollEvents' in the polling thread (NOT the broker thread).
+produceWithCallback :: KafkaProducer -> ProducerRecord
+                   -> (DeliveryReport -> IO ()) -> IO (Either KafkaException ())
+produceWithCallback producer record cb =
+  sendRecord producer record (Just cb)
+
+-- | Internal: sync produce. Broker thread fills the TMVar directly.
+sendRecordSync :: KafkaProducer -> ProducerRecord -> TMVar DeliveryReport
+               -> IO (Either KafkaException ())
+sendRecordSync producer record var = do
+  let topic = prTopic record
+  partCount <- ensureTopicMetadata producer topic
+  case partCount of
+    Left err -> pure (Left err)
+    Right count -> do
+      part <- selectPartition producer record count
+      mBroker <- leaderBrokerFor (kpClient producer) topic part
+      case mBroker of
+        Nothing -> pure (Left (KafkaException "no broker available"))
+        Just env -> do
+          now <- getMonotonicTimeNSec
+          drQueue <- resolveDeliveryQueue producer
+          let pm = PendingMessage
+                { pmEnqueueTime = fromIntegral (now `div` 1000)  -- ns → μs
+                , pmRecord = record
+                , pmPayload = case prValue record of { Just v -> v; Nothing -> "" }
+                , pmKey = prKey record
+                , pmHeaders = prHeaders record
+                , pmCallback = Nothing
+                , pmSyncVar = Just var
+                , pmDeliveryQueue = drQueue
+                , pmRetriesLeft = ccRetries (kpConfig producer)
+                }
+          accepted <- atomically $ do
+            full <- isFullTBQueue (beOps env)
+            if full
+              then pure False
+              else writeTBQueue (beOps env) (BrokerProduce topic part pm) >> pure True
+          if accepted
+            then pure (Right ())
+            else pure (Left KafkaQueueFullException)
+
+-- | Internal: async produce.
+sendRecord :: KafkaProducer -> ProducerRecord
+           -> Maybe (DeliveryReport -> IO ())
+           -> IO (Either KafkaException ())
+sendRecord producer record mCb = do
+  let topic = prTopic record
+  partCount <- ensureTopicMetadata producer topic
+  case partCount of
+    Left err -> pure (Left err)
+    Right count -> do
+      part <- selectPartition producer record count
+      mBroker <- leaderBrokerFor (kpClient producer) topic part
+      case mBroker of
+        Nothing -> pure (Left (KafkaException "no broker available"))
+        Just env -> do
+          now <- getMonotonicTimeNSec
+          drQueue <- resolveDeliveryQueue producer
+          let pm = PendingMessage
+                { pmEnqueueTime = fromIntegral (now `div` 1000)
+                , pmRecord = record
+                , pmPayload = case prValue record of { Just v -> v; Nothing -> "" }
+                , pmKey = prKey record
+                , pmHeaders = prHeaders record
+                , pmCallback = mCb
+                , pmSyncVar = Nothing
+                , pmDeliveryQueue = drQueue
+                , pmRetriesLeft = ccRetries (kpConfig producer)
+                }
+          accepted <- atomically $ do
+            full <- isFullTBQueue (beOps env)
+            if full
+              then pure False
+              else writeTBQueue (beOps env) (BrokerProduce topic part pm) >> pure True
+          if accepted
+            then pure (Right ())
+            else pure (Left KafkaQueueFullException)
+
+-- | Resolve which delivery queue to use: forwarded or default.
+resolveDeliveryQueue :: KafkaProducer -> IO (TBQueue DeliveryEntry)
+resolveDeliveryQueue producer = do
+  mFwd <- readTVarIO (kpForwardQueue producer)
+  pure $ case mFwd of
+    Just q  -> q
+    Nothing -> kpDeliveryQueue producer
+
+------------------------------------------------------------------------
+-- Delivery report polling
+------------------------------------------------------------------------
+
+-- | Poll for delivery reports, blocking up to @timeoutMs@ milliseconds.
+--
+-- Drains the delivery queue, invokes per-message callbacks and the
+-- global callback for each report, then returns all reports.
+--
+-- Semantics match @rd_kafka_poll@:
+--   * @timeoutMs = 0@: non-blocking drain (return immediately)
+--   * @timeoutMs > 0@: block until at least one report or timeout
+--   * @timeoutMs = -1@: block indefinitely until at least one report
+--
+-- Thread-safe. Designed to be called from a dedicated polling thread.
+pollEvents :: KafkaProducer -> Int -> IO [DeliveryReport]
+pollEvents producer timeoutMs = do
+  entries <- drainWithTimeout (kpDeliveryQueue producer) timeoutMs
+  -- Invoke callbacks in the polling thread (never in broker thread)
+  mapM (invokeCallbacks (kpGlobalCallback producer)) entries
+
+-- | Drain the queue with timeout semantics.
+drainWithTimeout :: TBQueue DeliveryEntry -> Int -> IO [DeliveryEntry]
+drainWithTimeout q timeoutMs = do
+  immediate <- atomically $ flushTBQueue q
+  case immediate of
+    (_:_) -> pure immediate
+    []    -> waitForEntries
+  where
+    waitForEntries
+      | timeoutMs == 0 = pure []
+      | otherwise = do
+          timer <- if timeoutMs < 0
+            then newTVarIO False
+            else registerDelay (timeoutMs * 1000)
+          atomically $ do
+            timedOut <- readTVar timer
+            if timedOut
+              then pure []
+              else do
+                first <- readTBQueue q
+                rest <- flushTBQueue q
+                pure (first : rest)
+
+-- | Invoke per-message callback + global callback, return the report.
+invokeCallbacks :: Maybe (DeliveryReport -> IO ()) -> DeliveryEntry -> IO DeliveryReport
+invokeCallbacks globalCb (DeliveryEntry dr mCb) = do
+  traverse_ ($ dr) mCb
+  traverse_ ($ dr) globalCb
+  pure dr
+
+------------------------------------------------------------------------
+-- Flush
+------------------------------------------------------------------------
+
+-- | Signal all broker threads to send pending batches immediately and
+-- wait for the send to complete. Does NOT drain delivery reports —
+-- use 'pollEvents' or 'flush' for that.
+--
+-- This is a low-level primitive. Most users want 'flush' instead.
+flushProducer :: KafkaProducer -> IO ()
+flushProducer producer = do
+  brokers <- readTVarIO (kcBrokers (kpClient producer))
+  doneVars <- mapM flushOne (IM.elems brokers)
+  atomically $ mapM_ readTMVar doneVars
+  rotatePartitions producer
+  where
+    flushOne env = do
+      done <- newEmptyTMVarIO
+      atomically $ writeTBQueue (beControlOps env) (BrokerFlush done)
+      pure done
+
+-- | Result of a flush operation.
+data FlushResult = FlushOk !Int | FlushTimedOut !Int
+  deriving (Eq, Show)
+
+-- | Flush and drain delivery reports. Matches rd_kafka_flush semantics:
+--
+-- 1. Signals all broker threads to send immediately (ignores linger.ms)
+-- 2. Waits for batches to be sent
+-- 3. Polls delivery reports (invoking callbacks) until the queue is
+--    empty or @timeoutMs@ expires
+--
+-- The timeout does NOT cancel mid-drain — it only limits how long we
+-- wait for reports to arrive. Returns the number of reports processed.
+flush :: KafkaProducer -> Int -> IO Int
+flush producer timeoutMs = do
+  flushProducer producer
+  drainDeliveryReports producer timeoutMs
+
+-- | Drain delivery reports, invoking callbacks via 'pollEvents'.
+-- Keeps polling until the queue is empty (after receiving at least one
+-- batch of reports) or timeout expires.
+drainDeliveryReports :: KafkaProducer -> Int -> IO Int
+drainDeliveryReports producer timeoutMs = go 0 timeoutMs False
+  where
+    go !count !remaining !hadReports
+      | remaining <= 0 = pure count
+      | otherwise = do
+          let pollMs = min 200 remaining
+          reports <- pollEvents producer pollMs
+          if null reports
+            then if hadReports
+              then pure count  -- had reports, now empty → settled
+              else go count (remaining - pollMs) False  -- keep waiting
+            else go (count + length reports) (remaining - pollMs) True
+
+------------------------------------------------------------------------
+-- Queue inspection
+------------------------------------------------------------------------
+
+-- | Number of messages waiting in outbound queues (not yet sent).
+-- Matches rd_kafka_outq_len semantics.
+outboundQueueLength :: KafkaProducer -> IO Int
+outboundQueueLength producer = do
+  brokers <- readTVarIO (kcBrokers (kpClient producer))
+  counts <- mapM getBrokerQueueLen (IM.elems brokers)
+  pure (sum counts)
+  where
+    getBrokerQueueLen env = atomically $ do
+      opsLen <- lengthTBQueue (beOps env)
+      inflightLen <- readTVar (beInflightCount env)
+      pure (fromIntegral opsLen + inflightLen)
+
+------------------------------------------------------------------------
+-- Internal: metadata + partitioning
+------------------------------------------------------------------------
+
+ensureTopicMetadata :: KafkaProducer -> TopicName -> IO (Either KafkaException Int32)
+ensureTopicMetadata producer topic = do
+  mCount <- partitionCountFor (kpClient producer) topic
+  case mCount of
+    Just count -> pure (Right count)
+    Nothing -> do
+      result <- refreshTopicMetadata (kpClient producer) topic
+      case result of
         Left err -> pure (Left err)
         Right () -> do
-          interrupt <- registerDelay 30000000
-          getProduceResponse k interrupt handle >>= \case
-            Left err -> pure (Left err)
-            Right (Left msg) -> pure (Left (KafkaParseException msg))
-            Right (Right resp) ->
-              let errs =
-                    [ prResponseErrorCode r
-                    | x <- produceResponseMessages resp
-                    , r <- prPartitionResponses x
-                    , prResponseErrorCode r /= 0
-                    ]
-               in case errs of
-                    [] -> pure (Right ())
-                    err : _ -> case fromErrorCode err of
-                      -- TODO: should this be turned into `UnknownServerError`?
-                      Nothing -> pure (Right ())
-                      Just e -> pure (Left (KafkaProtocolException e))
-    else do
-      pure (Right ())
+          mCount' <- partitionCountFor (kpClient producer) topic
+          case mCount' of
+            Just count -> pure (Right count)
+            Nothing -> pure (Left (KafkaException "topic not found after metadata refresh"))
 
--- | Send messages to Kafka.
-produce ::
-     Producer -- ^ Producer
-  -> TopicName -- ^ Topic to which we push
-  -> UnliftedArray ByteArray -- ^ Messages
-  -> IO (Either KafkaException ())
-produce producer@(Producer k t _ handle) topicName msgs = do
-  tops <- readIORef t
-  case Map.lookup topicName tops of
-    Just topicState -> produce' producer topicState msgs
-    Nothing -> do
-      newTopic <- makeTopic k topicName handle
-      case newTopic of
-        Right top -> do
-          modifyIORef t (Map.insert topicName top)
-          produce' producer top msgs
-        Left err -> pure (Left err)
+selectPartition :: KafkaProducer -> ProducerRecord -> Int32 -> IO Int32
+selectPartition producer record count = case prPartition record of
+  SpecifiedPartition p -> pure p
+  UnassignedPartition -> case prKey record of
+    Just key -> pure (fromIntegral (murmur2 key `mod` count))
+    Nothing  -> stickyPartition producer (prTopic record) count
+
+-- | Sticky partition: returns the same partition for a topic until
+-- rotatePartitions is called (on batch flush). Improves batching.
+stickyPartition :: KafkaProducer -> TopicName -> Int32 -> IO Int32
+stickyPartition producer topic _count = do
+  ref <- modifyMVar (kpCounters producer) $ \m ->
+    case Map.lookup topic m of
+      Just ref -> pure (m, ref)
+      Nothing -> do
+        ref <- newIORef 0
+        pure (Map.insert topic ref m, ref)
+  fromIntegral <$> readIORef ref
+
+-- | Rotate sticky partition counters. Called after flush.
+rotatePartitions :: KafkaProducer -> IO ()
+rotatePartitions producer = do
+  counters <- readMVar (kpCounters producer)
+  void $ Map.traverseWithKey rotateOne counters
+  where
+    rotateOne topic ref = do
+      mCount <- partitionCountFor (kpClient producer) topic
+      traverse_ (\count ->
+        atomicModifyIORef' ref $ \n ->
+          let n' = if n + 1 >= fromIntegral count then 0 else n + 1
+          in (n', ())
+        ) mCount

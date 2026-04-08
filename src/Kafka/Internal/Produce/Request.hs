@@ -1,207 +1,100 @@
-{-# language
-    BangPatterns
-  , DataKinds
-  , DeriveFunctor
-  , FlexibleContexts
-  , GeneralizedNewtypeDeriving
-  , MultiParamTypeClasses
-  , OverloadedStrings
-  , PolyKinds
-  , RankNTypes
-  , TypeFamilies
-  , UnboxedTuples
-  , UndecidableInstances
-  #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Kafka.Internal.Produce.Request
-  ( produceRequest
+  ( ProduceRequestParams(..)
+  , buildProduceRequest
   ) where
 
-import Data.Bytes.Types
-import Data.Foldable
-import Data.Primitive.Slice (UnliftedVector(UnliftedVector))
-import Data.Primitive.Unlifted.Array
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BSL
+import Data.Int (Int16, Int32, Int64)
 
-import qualified Crc32c as CRC
-import qualified String.Ascii as S
-
-import Kafka.Common
+import Kafka.Common (TopicName(..))
+import Kafka.Internal.Compression (compressBatch)
+import Kafka.Internal.Config (Compression(..))
+import Kafka.Internal.RecordBatch (RecordInput(..), buildRecordBatch, buildRecords, wrapRecordBatch)
 import Kafka.Internal.Writer
-import Kafka.Internal.Zigzag (zigzag)
-
--- idk what this is
-magic :: Int8
-magic = 2
 
 produceApiVersion :: Int16
-produceApiVersion = 7
+produceApiVersion = 9
 
 produceApiKey :: Int16
 produceApiKey = 0
 
-defaultBaseOffset :: Int64
-defaultBaseOffset = 0
+-- | Parameters for building a produce request.
+data ProduceRequestParams = ProduceRequestParams
+  { prpCorrId        :: {-# UNPACK #-} !Int32
+  , prpAcks          :: {-# UNPACK #-} !Int16
+  , prpClientId      :: !ByteString
+  , prpTimeoutMs     :: {-# UNPACK #-} !Int
+  , prpTopic         :: !TopicName
+  , prpPartition     :: {-# UNPACK #-} !Int32
+  , prpProducerId    :: {-# UNPACK #-} !Int64
+  , prpProducerEpoch :: {-# UNPACK #-} !Int16
+  , prpBaseSequence  :: {-# UNPACK #-} !Int32
+  , prpCompression   :: !Compression
+  , prpFirstTs       :: {-# UNPACK #-} !Int64
+  }
 
-defaultPartitionLeaderEpoch :: Int32
-defaultPartitionLeaderEpoch = 0
-
-defaultRecordAttributes :: Int8
-defaultRecordAttributes = 0
-
-defaultTimestampDelta :: Int
-defaultTimestampDelta = 0
-
-defaultFirstTimestamp :: Int64
-defaultFirstTimestamp = 0
-
-defaultMaxTimestamp :: Int64
-defaultMaxTimestamp = 0
-
-defaultProducerId :: Int64
-defaultProducerId = -1
-
-defaultProducerEpoch :: Int16
-defaultProducerEpoch = -1
-
-defaultBaseSequence :: Int32
-defaultBaseSequence = -1
-
-defaultRecordBatchAttributes :: Int16
-defaultRecordBatchAttributes = 0
-
-data Acknowledgments
-  = AckLeaderOnly
-  | NoAcknowledgments
-  | AckFullISR
-
-defaultAcknowledgments :: Acknowledgments
-defaultAcknowledgments = AckLeaderOnly
-
-acks :: Acknowledgments -> Int16
-acks AckLeaderOnly = 1
-acks NoAcknowledgments = 0
-acks AckFullISR = -1
-
-makeRecordMetadata :: Int -> ByteArray -> ByteArray
-makeRecordMetadata index content =
+-- | Build a Produce v9 request as a strict ByteString.
+-- Single BuildR materialization — no intermediate BSL concatenation.
+buildProduceRequest :: ProduceRequestParams -> [RecordInput] -> ByteString
+buildProduceRequest !params records =
   let
-    -- plus one is for the trailing null byte
-    recordLength = zigzag (sizeofByteArray metadataContent + sizeofByteArray content + 1)
-    metadataContent = fold
-      [ byteArrayFromList [defaultRecordAttributes]
-      , zigzag defaultTimestampDelta
-      , zigzag index -- offsetDelta
-      , zigzag (-1) -- keyLength
-      , zigzag (sizeofByteArray content) -- valueLen
-      ]
-  in
-    recordLength <> metadataContent
+    !n = length records
 
-sumSizes :: UnliftedArray ByteArray -> Int
-sumSizes = foldrUnliftedArray (\e acc -> acc + sizeofByteArray e) 0
+    !batchBS = case prpCompression params of
+      NoCompression ->
+        buildRecordBatch (prpProducerId params) (prpProducerEpoch params)
+          (prpBaseSequence params) 0 (prpFirstTs params) records
+      _ ->
+        let !rawRecords = buildRecords records
+            (!compRecords, !attr) = compressBatch (prpCompression params) rawRecords
+        in if attr == 0
+          then buildRecordBatch (prpProducerId params) (prpProducerEpoch params)
+                 (prpBaseSequence params) 0 (prpFirstTs params) records
+          else wrapRecordBatch (prpProducerId params) (prpProducerEpoch params)
+                 (prpBaseSequence params) attr n (prpFirstTs params) compRecords
 
-produceRequestRecordBatchMetadata ::
-     UnliftedArray ByteArray
-  -> Int
-  -> Int
-  -> ByteArray
-produceRequestRecordBatchMetadata payloadsSectionChunks payloadCount payloadsSectionSize =
-  let
-    crc =
-      CRC.chunks
-        (CRC.bytes 0 (Bytes postCrc 0 postCrcLength))
-        (UnliftedVector payloadsSectionChunks 0 (3*payloadCount))
-    batchLength = fromIntegral $
-        preCrcLength
-      + postCrcLength
-      + payloadsSectionSize
-    preCrcLength = 9
-    preCrc = build $
-      int64 defaultBaseOffset
-      <> int32 batchLength
-      <> int32 defaultPartitionLeaderEpoch
-      <> int8 magic
-      <> int32 (fromIntegral crc)
-    postCrcLength = 40
-    postCrc = build $
-      int16 defaultRecordBatchAttributes
-      <> int32 (fromIntegral (payloadCount - 1))
-      <> int64 defaultFirstTimestamp
-      <> int64 defaultMaxTimestamp
-      <> int64 defaultProducerId
-      <> int16 defaultProducerEpoch
-      <> int32 defaultBaseSequence
-      <> int32 (fromIntegral payloadCount)
-  in
-    preCrc <> postCrc
+    !batchLen = BS.length batchBS
+    TopicName !tn = prpTopic params
+    !topicLen = BS.length tn
 
-makeRequestMetadata :: ()
-  => Int -- ^ record batch section size
-  -> Int -- ^ timeout (microseconds)
-  -> TopicName -- ^ topic name
-  -> Int32 -- ^ partition
-  -> ByteArray
-makeRequestMetadata !rbss !timeout tn !partition = build $
-  int32 size
-  <> int16 produceApiKey
-  <> int16 produceApiVersion
-  <> int32 correlationId
-  <> string clientId clientIdLength
-  <> int16 (-1) -- transactional_id length
-  <> int16 (acks defaultAcknowledgments) -- acks
-  <> int32 (fromIntegral timeout) -- timeout in ms
-  <> int32 1 -- following array length
-  <> topicName tn -- topic_data topic
-  <> int32 1 -- following array [data] length
-  <> int32 partition -- partition
-  <> int32 (fromIntegral rbss) -- record_set length
-  where
-    minimumSize = 36
-    topicNameSize = S.length (coerce tn)
-    size = fromIntegral $ 0
-      + minimumSize
-      + clientIdLength
-      + topicNameSize
-      + rbss
+    !prefixBuilder =
+      int16 produceApiKey
+      <> int16 produceApiVersion
+      <> int32 (prpCorrId params)
+      <> string (prpClientId params)
+      <> taggedFields
+      <> compactNullableString Nothing
+      <> int16 (prpAcks params)
+      <> int32 (fromIntegral (prpTimeoutMs params))
+      <> unsignedVarInt 2
+      <> compactString tn
+      <> unsignedVarInt 2
+      <> int32 (prpPartition params)
+      <> unsignedVarInt (batchLen + 1)
 
-produceRequest ::
-     Int
-  -> TopicName
-  -> Int32
-  -> UnliftedArray ByteArray
-  -> UnliftedArray ByteArray
-produceRequest timeout topic partition payloads =
-  let
-    payloadCount = sizeofUnliftedArray payloads
-    zero = runST $ do
-      ba <- newByteArray 1
-      writeByteArray ba 0 (0 :: Word8)
-      unsafeFreezeByteArray ba
-    recordBatchSectionSize = 0
-      + sumSizes payloadsSectionChunks
-      + sizeofByteArray recordBatchMetadata
-    requestMetadata = makeRequestMetadata
-      recordBatchSectionSize
-      timeout
-      topic
-      partition
-    recordBatchMetadata =
-      produceRequestRecordBatchMetadata
-        payloadsSectionChunks
-        payloadCount
-        (sumSizes payloadsSectionChunks)
-    payloadsSectionChunks = runUnliftedArray $ do
-      arr <- newUnliftedArray (3 * payloadCount) zero
-      itraverseUnliftedArray_
-        (\i payload -> do
-          writeUnliftedArray arr (i * 3) (makeRecordMetadata i payload)
-          writeUnliftedArray arr (i * 3 + 1) payload
-          writeUnliftedArray arr (i * 3 + 2) zero)
-        payloads
-      pure arr
-  in runUnliftedArray $ do
-    arr <- newUnliftedArray (3 * payloadCount + 2) zero
-    writeUnliftedArray arr 0 requestMetadata
-    writeUnliftedArray arr 1 recordBatchMetadata
-    copyUnliftedArray arr 2 payloadsSectionChunks 0 (3 * payloadCount)
-    pure arr
+    !suffixBuilder = taggedFields <> taggedFields <> taggedFields
+
+    -- Compute body size arithmetically
+    !prefixSize = 24 + BS.length (prpClientId params)
+                + uvarSize (topicLen + 1) + topicLen
+                + uvarSize (batchLen + 1)
+    !bodySize = fromIntegral (prefixSize + batchLen + 3) :: Int32
+
+    -- Single BuildR, single materialization
+    !fullRequest = int32 bodySize <> prefixBuilder <> bs batchBS <> suffixBuilder
+
+  in BSL.toStrict (toLazyByteString fullRequest)
+
+uvarSize :: Int -> Int
+uvarSize n
+  | n < 0x80       = 1
+  | n < 0x4000     = 2
+  | n < 0x200000   = 3
+  | n < 0x10000000 = 4
+  | otherwise       = 5
+{-# INLINE uvarSize #-}
