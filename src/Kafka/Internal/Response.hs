@@ -10,7 +10,7 @@ import Control.Exception (try, IOException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Network.Socket.ByteString as NBS
-import Control.Concurrent.STM (TVar)
+import System.Timeout (timeout)
 
 import Kafka.Common
 import Kafka.Internal.Wire (Wire)
@@ -32,20 +32,25 @@ recvExact kafka n = do
         else go (remaining - BS.length chunk) (chunk : acc)
 
 -- | Read a full Kafka response (size header + body) as a ByteString.
+-- The @timeoutUs@ parameter is in microseconds. If the read does not
+-- complete within this time, returns a timeout error.
 getKafkaResponse ::
      Kafka
-  -> TVar Bool
+  -> Int        -- ^ Timeout in microseconds
   -> IO (Either KafkaException ByteString)
-getKafkaResponse kafka _interrupt =
-  getResponseSizeHeader kafka _interrupt >>= \case
-    Right byteCount -> recvExact kafka byteCount
-    Left e -> pure (Left e)
+getKafkaResponse kafka timeoutUs = do
+  mResult <- timeout timeoutUs $
+    getResponseSizeHeader kafka >>= \case
+      Right byteCount -> recvExact kafka byteCount
+      Left e -> pure (Left e)
+  case mResult of
+    Nothing -> pure (Left (KafkaIOError "response read timed out"))
+    Just r  -> pure r
 
 getResponseSizeHeader ::
      Kafka
-  -> TVar Bool
   -> IO (Either KafkaException Int)
-getResponseSizeHeader kafka _interrupt = do
+getResponseSizeHeader kafka = do
   result <- recvExact kafka 4
   case result of
     Left e -> pure (Left e)
@@ -58,9 +63,9 @@ getResponseSizeHeader kafka _interrupt = do
 
 -- | Read a response from the socket and parse it with a Wire parser.
 -- Used by old Consumer-path code that reads directly from a socket.
-parseResponse :: Wire a -> Kafka -> TVar Bool -> IO (Either KafkaException a)
-parseResponse parser kafka interrupt =
-  getKafkaResponse kafka interrupt >>= \case
+parseResponse :: Wire a -> Kafka -> Int -> IO (Either KafkaException a)
+parseResponse parser kafka timeoutUs =
+  getKafkaResponse kafka timeoutUs >>= \case
     Left err -> pure (Left err)
     Right bs -> case Wire.runWire parser bs of
       Nothing -> pure (Left (KafkaParseException "wire parse failed"))

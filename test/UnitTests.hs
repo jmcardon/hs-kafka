@@ -23,6 +23,7 @@ import Kafka.Internal.JoinGroup.Request
 import Kafka.Internal.ListOffsets.Request
 import Kafka.Internal.Murmur2 (murmur2)
 import Kafka.Internal.Produce.Request (ProduceRequestParams(..), buildProduceRequest)
+import qualified Kafka.Internal.RecordBatch
 import Kafka.Internal.RecordBatch (RecordInput(..))
 import Kafka.Internal.Produce.Response
 import Kafka.Internal.Wire (Wire, runWire)
@@ -315,6 +316,51 @@ idempotentProduceTests = testGroup "Idempotent produce"
           plain = buildProduceRequest (testParams 0 1 "test" "test") [ri payload]
       assertBool "compressed should differ" (compressed /= plain)
       assertBool "compressed should be shorter" (B.length compressed < B.length plain)
+  , compressionRequestTests
+  ]
+
+-- | Verify every codec actually compresses at the request level with realistic batches.
+-- Uses multiple records of repetitive data (like the benchmark) and verifies:
+--   1. Request is shorter than uncompressed
+--   2. Attributes in the record batch have the correct codec bits
+--   3. The compressed records round-trip through decompressBatch
+compressionRequestTests :: TestTree
+compressionRequestTests = testGroup "Compression in produce request"
+  [ compressionRequestTest "Gzip"   Gzip   1
+  , compressionRequestTest "Snappy" Snappy 2
+  , compressionRequestTest "Lz4"    Lz4    3
+  , compressionRequestTest "Zstd"   Zstd   4
+  ]
+
+compressionRequestTest :: String -> Compression -> Int16 -> TestTree
+compressionRequestTest name codec expectedAttr = testGroup name
+  [ testCase "request is shorter with multi-record batch" $ do
+      let records = replicate 100 (ri (B.replicate 100 0x41))
+          params  = testParams 0 1 "t" "t"
+          plain   = buildProduceRequest params records
+          comp    = buildProduceRequest params { prpCompression = codec } records
+      assertBool ("compressed request should be shorter: plain="
+                  ++ show (B.length plain) ++ " comp=" ++ show (B.length comp))
+        (B.length comp < B.length plain)
+  , testCase "record batch attributes has correct codec bits" $ do
+      let records = replicate 100 (ri (B.replicate 100 0x41))
+          rawRecords = Kafka.Internal.RecordBatch.buildRecords records
+          (compressed, attr) = compressBatch codec rawRecords
+      -- With 100 records of 100 bytes each, compression must help
+      assertBool "compression should activate (attr /= 0)" (attr /= 0)
+      attr @?= expectedAttr
+      -- Verify the compressed data is actually shorter
+      assertBool ("compressed records should be shorter: raw="
+                  ++ show (B.length rawRecords) ++ " comp=" ++ show (B.length compressed))
+        (B.length compressed < B.length rawRecords)
+  , testCase "compressed records round-trip through decompress" $ do
+      let records = replicate 100 (ri (B.replicate 100 0x41))
+          rawRecords = Kafka.Internal.RecordBatch.buildRecords records
+          (compressed, attr) = compressBatch codec rawRecords
+      assertBool "compression should activate" (attr /= 0)
+      case decompressBatch (fromIntegral attr) compressed of
+        Left err -> assertFailure ("decompression failed: " ++ err)
+        Right decompressed -> decompressed @?= rawRecords
   ]
 
 goldenTests :: TestTree

@@ -22,6 +22,7 @@ module Kafka.Consumer.Types
   , ConsumerMode(..)
   ) where
 
+import Control.Concurrent.Async (Async)
 import Control.Concurrent.STM (TVar, TBQueue)
 import Data.ByteString (ByteString)
 import Data.Int (Int16, Int32, Int64)
@@ -139,6 +140,8 @@ data KafkaConsumer = KafkaConsumer
     -- ^ Paused partitions (fetch skips these).
   , consMode         :: !(TVar ConsumerMode)
     -- ^ Subscribe mode (group) or assign mode (direct).
+  , consHeartbeat    :: !(TVar (Maybe (Async ())))
+    -- ^ Current heartbeat thread. Tracked so we can cancel on rejoin.
   }
 
 -- | Consumer operating mode.

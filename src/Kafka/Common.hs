@@ -33,7 +33,7 @@ module Kafka.Common
   , correlationId
   ) where
 
-import Control.Exception (bracket, try, IOException)
+import Control.Exception (Exception, bracket, try, IOException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int16, Int32, Int64)
@@ -81,7 +81,13 @@ data KafkaException
   | KafkaOffsetCommitException ![OffsetCommitErrorMessage]
   | KafkaFetchException ![FetchErrorMessage]
   | KafkaUnexpectedErrorCodeException !Int16
+  | KafkaQueueFullException
+    -- ^ The broker's outbound queue is full (backpressure).
+    -- Matches librdkafka's RD_KAFKA_RESP_ERR__QUEUE_FULL.
+    -- Returned as a value in Either, never thrown.
   deriving (Show)
+
+instance Exception KafkaException
 
 data OffsetCommitErrorMessage = OffsetCommitErrorMessage
   { commitErrorTopic :: {-# UNPACK #-} !TopicName
@@ -132,6 +138,8 @@ connectBroker host port = do
   let hints = defaultHints { addrSocketType = Stream }
   addr:_ <- getAddrInfo (Just hints) (Just host) (Just port)
   sock <- openSocket addr
+  setSocketOption sock NoDelay 1
+  setSocketOption sock KeepAlive 1
   connect sock (addrAddress addr)
   pure sock
 

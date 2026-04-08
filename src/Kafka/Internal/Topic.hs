@@ -32,9 +32,8 @@ makeTopic kafka topicName handle = do
 getPartitionCount :: Kafka -> TopicName -> Int -> Maybe Handle -> IO (Either KafkaException Int32)
 getPartitionCount kafka topicName timeout _handle = runExceptT $ do
   _ <- ExceptT $ metadata kafka (MetadataRequest topicName NeverCreate) _handle
-  interrupt <- liftIO $ registerDelay timeout
   parts <- fmap (metadataPartitions topicName) $ ExceptT $
-    parseResponse M.parseMetadataResponse kafka interrupt
+    parseResponse M.parseMetadataResponse kafka timeout
   case parts of
     Just p -> pure p
     Nothing -> throwError $

@@ -34,6 +34,7 @@ module Kafka.Internal.Broker
   , stopBroker
   , enqueueRequest
   , setIdempotentState
+  , deliverReportIO
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
@@ -141,13 +142,10 @@ batchIsEmpty b = batchCount b == 0
 {-# INLINE batchAdd #-}
 batchAdd :: Batch -> TopicName -> Int32 -> PendingMessage -> Batch
 batchAdd (Batch groups cnt bytes) topic part msg = Batch
-  { batchGroups = Map.alter addMsg (topic, part) groups
+  { batchGroups = Map.insertWith (\_ old -> msg : old) (topic, part) [msg] groups
   , batchCount  = cnt + 1
   , batchBytes  = bytes + BS.length (pmPayload msg)
   }
-  where
-    addMsg Nothing    = Just [msg]
-    addMsg (Just old) = Just (msg : old)
 
 -- | Check if batch meets send thresholds (size or count).
 -- Linger timeout is handled separately via STM.
@@ -175,6 +173,11 @@ data BrokerEnv = BrokerEnv
     -- ^ When set, enables idempotent produce with PID/epoch/sequences.
     -- Mutable so Producer can set it after InitProducerId without
     -- replacing the BrokerEnv in the client's IntMap.
+  , beOnRetry        :: !(TopicName -> Int32 -> PendingMessage -> IO ())
+    -- ^ Callback for retrying messages that need re-routing (e.g. after
+    -- NotLeaderForPartition). The client layer sets this to trigger a
+    -- metadata refresh and re-enqueue to the correct leader broker.
+    -- Default: re-enqueue to this broker's own ops queue (no re-routing).
   }
 
 -- | Shared idempotent producer state, set from the Producer layer.
@@ -216,6 +219,8 @@ newBrokerEnv cfg nodeId peer = do
     , beShutdown       = shutdown
     , beApiVersions    = apiVers
     , beIdempotent     = idempRef
+    , beOnRetry        = \topic part msg ->
+        atomically $ writeTBQueue ops (BrokerProduce topic part msg)
     }
 
 -- | Set idempotent state on a broker env (called from Producer after InitProducerId).
@@ -305,8 +310,8 @@ performHandshake env kafka = do
   case result of
     Left _ -> pure ()  -- handshake failed, proceed without version info
     Right () -> do
-      interrupt <- registerDelay (ccRequestTimeoutMs (beConfig env) * 1000)
-      resp <- getKafkaResponse kafka interrupt
+      let timeoutUs = ccRequestTimeoutMs (beConfig env) * 1000
+      resp <- getKafkaResponse kafka timeoutUs
       case resp of
         Left _ -> pure ()
         Right responseBytes ->
@@ -411,7 +416,7 @@ flushBatch env kafka batch = do
       Map.foldlWithKey' (\act k msgs -> act >> do
         let (expired, live) = partition (\m -> pmEnqueueTime m < cutoffUs) msgs
         forM_ expired $ \m ->
-          deliverReportIO m (DeliveryFailure (pmRecord m) "message timed out")
+          deliverReportIO m (DeliveryFailure (pmRecord m) "message timed out" 0)
         unless (null live) $
           sendPartitionBatch env kafka (k, live)
         ) (pure ()) (batchGroups batch)
@@ -476,7 +481,7 @@ sendPartitionBatch env kafka ((topic, part), msgsRev) = do
       invokeErrorCallback env ("send failed on broker " ++ show (beNodeId env) ++ ": " ++ show err)
       let errBS = BS8.pack (show err)
       forM_ msgs $ \m ->
-        deliverReportIO m (DeliveryFailure (pmRecord m) errBS)
+        deliverReportIO m (DeliveryFailure (pmRecord m) errBS 0)
       atomically $ do
         modifyTVar' (beInflight env) $ IM.delete (fromIntegral corrId)
         modifyTVar' (beInflightCount env) (subtract 1)
@@ -512,9 +517,8 @@ receiverLoop :: BrokerEnv -> Kafka -> IO ()
 receiverLoop env kafka = do
   done <- readTVarIO (beShutdown env)
   unless done $ do
-    -- Use a long timeout for response reading
-    interrupt <- registerDelay (ccRequestTimeoutMs (beConfig env) * 1000)
-    result <- getKafkaResponse kafka interrupt
+    let timeoutUs = ccRequestTimeoutMs (beConfig env) * 1000
+    result <- getKafkaResponse kafka timeoutUs
     case result of
       Left _err -> pure ()  -- socket error → session will end
       Right responseBytes -> do
@@ -549,7 +553,7 @@ dispatchResponse env responseBytes = do
           invokeErrorCallback env "failed to parse ProduceResponse"
           forM_ callbacks $ \(_part, msgs) ->
             forM_ msgs $ \m ->
-              deliverReportIO m (DeliveryFailure (pmRecord m) "failed to parse ProduceResponse")
+              deliverReportIO m (DeliveryFailure (pmRecord m) "failed to parse ProduceResponse" 0)
         Just prodResp ->
           dispatchProduceResponse env topic callbacks prodResp
 
@@ -561,48 +565,56 @@ dispatchProduceResponse :: BrokerEnv
                        -> ProduceResponse
                        -> IO ()
 dispatchProduceResponse env topic callbacks prodResp = do
-  -- Build a map of partition → (errorCode, baseOffset)
+  nowUs <- fromIntegral . (`div` 1000) <$> getMonotonicTimeNSec
+  -- Build a map of partition → (errorCode, baseOffset, logAppendTime)
   let partResults = Map.fromList
-        [ (prResponsePartition pr, (prResponseErrorCode pr, prResponseBaseOffset pr))
+        [ (prResponsePartition pr, (prResponseErrorCode pr, prResponseBaseOffset pr, prResponseLogAppendTime pr))
         | msg <- produceResponseMessages prodResp
         , pr  <- prPartitionResponses msg
         ]
+      brokerId = beNodeId env
   forM_ callbacks $ \(part, msgs) ->
     case Map.lookup part partResults of
       Nothing ->
-        deliverAll msgs (Offset 0)  -- no entry → treat as success
-      Just (0, baseOff) ->
-        deliverAll msgs (Offset baseOff)
-      Just (errCode, _) -> case fromErrorCode errCode of
+        deliverSuccessBatch nowUs brokerId part msgs 0 (-1)
+      Just (0, baseOff, logTs) ->
+        deliverSuccessBatch nowUs brokerId part msgs baseOff logTs
+      Just (errCode, _, _) -> case fromErrorCode errCode of
         Nothing ->
-          failAll msgs (BS8.pack ("unknown error code: " ++ show errCode))
+          deliverFailBatch msgs (BS8.pack ("unknown error code: " <> show errCode)) errCode
         Just protoErr
           | isRetriable protoErr ->
-              forM_ msgs $ \m ->
+              let errBS = BS8.pack (show protoErr)
+              in forM_ msgs $ \m ->
                 if pmRetriesLeft m > 0
-                  then atomically $ writeTBQueue (beOps env)
-                    (BrokerProduce topic part m { pmRetriesLeft = pmRetriesLeft m - 1 })
-                  else deliverReport m (DeliveryFailure (pmRecord m) (BS8.pack (show protoErr)))
+                  then beOnRetry env topic part
+                    m { pmRetriesLeft = pmRetriesLeft m - 1 }
+                  else deliverReport m (DeliveryFailure (pmRecord m) errBS errCode)
           | otherwise ->
-              forM_ msgs $ \m ->
-                deliverReport m (DeliveryFailure (pmRecord m) (BS8.pack (show protoErr)))
+              deliverFailBatch msgs (BS8.pack (show protoErr)) errCode
   where
-    -- Deliver success reports with sequential offsets starting at baseOffset.
-    deliverAll [] _ = pure ()
-    deliverAll (m:rest) !off = do
-      deliverReport m (DeliverySuccess (pmRecord m) off)
-      deliverAll rest (Offset (unOffset off + 1))
+    deliverSuccessBatch nowUs brokerId part msgs baseOff logTs =
+      forM_ (zip msgs [0..]) $ \(m, i) -> do
+        let !latencyUs = nowUs - pmEnqueueTime m
+        deliverReport m DeliverySuccess
+          { drRecord = pmRecord m
+          , drOffset = Offset (baseOff + i)
+          , drPartition = part
+          , drBrokerId = brokerId
+          , drLatencyUs = latencyUs
+          , drTimestamp = logTs
+          }
 
-    failAll msgs errBS = forM_ msgs $ \m ->
-      deliverReport m (DeliveryFailure (pmRecord m) errBS)
+    deliverFailBatch msgs errBS errCode = forM_ msgs $ \m ->
+      deliverReport m (DeliveryFailure (pmRecord m) errBS errCode)
 
     -- Push delivery entry to queue + fill sync TMVar. No user callbacks.
+    -- Blocks if delivery queue is full (never silently drops reports).
     deliverReport :: PendingMessage -> DeliveryReport -> IO ()
     deliverReport m dr = atomically $ do
       traverse_ (\var -> putTMVar var dr) (pmSyncVar m)
       let !entry = DeliveryEntry dr (pmCallback m)
-      full <- isFullTBQueue (pmDeliveryQueue m)
-      unless full $ writeTBQueue (pmDeliveryQueue m) entry
+      writeTBQueue (pmDeliveryQueue m) entry
 
 ------------------------------------------------------------------------
 -- Failure handling
@@ -623,7 +635,7 @@ failAllInflight env = do
     InflightBatch _ callbacks ->
       forM_ callbacks $ \(_, msgs) ->
         forM_ msgs $ \m ->
-          deliverReportIO m (DeliveryFailure (pmRecord m) "broker connection lost")
+          deliverReportIO m (DeliveryFailure (pmRecord m) "broker connection lost" 0)
 
 -- | Push a delivery entry to the queue (IO version for use outside dispatch).
 -- | Convert a PendingMessage to a RecordInput for the batch encoder.
@@ -640,8 +652,7 @@ deliverReportIO :: PendingMessage -> DeliveryReport -> IO ()
 deliverReportIO m dr = atomically $ do
   traverse_ (\var -> putTMVar var dr) (pmSyncVar m)
   let !entry = DeliveryEntry dr (pmCallback m)
-  full <- isFullTBQueue (pmDeliveryQueue m)
-  unless full $ writeTBQueue (pmDeliveryQueue m) entry
+  writeTBQueue (pmDeliveryQueue m) entry
 
 ------------------------------------------------------------------------
 -- Callbacks
@@ -660,7 +671,9 @@ invokeErrorCallback env msg =
 ------------------------------------------------------------------------
 
 nextCorrId :: IORef Int32 -> IO Int32
-nextCorrId ref = atomicModifyIORef' ref $ \n -> (n + 1, n)
+nextCorrId ref = atomicModifyIORef' ref $ \n ->
+  let n' = if n >= 0x7FFFFFFE then 0 else n + 1
+  in (n', n)
 
 -- | Extract correlation ID from the first 4 bytes of a response body.
 -- Kafka response format: [4-byte size (already consumed)] [4-byte corrId] [...]

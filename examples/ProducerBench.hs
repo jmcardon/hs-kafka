@@ -182,8 +182,8 @@ pollerLoop producer stats shutdownVar = do
   unless done $ do
     reports <- pollEvents producer 100  -- 100ms timeout
     forM_ reports $ \dr -> case dr of
-      DeliverySuccess _ _ -> inc (stDelivered stats)
-      DeliveryFailure _ _ -> inc (stFailed stats)
+      DeliverySuccess{} -> inc (stDelivered stats)
+      DeliveryFailure{} -> inc (stFailed stats)
 
     -- Count batch completions (every batchSize deliveries)
     delivered <- readIORef (stDelivered stats)

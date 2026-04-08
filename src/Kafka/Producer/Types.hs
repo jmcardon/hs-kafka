@@ -15,7 +15,7 @@ module Kafka.Producer.Types
   ) where
 
 import Data.ByteString (ByteString)
-import Data.Int (Int32, Int64)
+import Data.Int (Int16, Int32, Int64)
 import Kafka.Common (TopicName)
 
 -- | A message to be produced to Kafka.
@@ -38,9 +38,26 @@ newtype Offset = Offset { unOffset :: Int64 }
   deriving (Eq, Show, Ord)
 
 -- | The result of producing a message.
+-- Matches librdkafka's rd_kafka_message_t delivery report fields.
 data DeliveryReport
-  = DeliverySuccess !ProducerRecord !Offset
-  | DeliveryFailure !ProducerRecord !ByteString
+  = DeliverySuccess
+      { drRecord    :: !ProducerRecord
+      , drOffset    :: !Offset
+      , drPartition :: {-# UNPACK #-} !Int32
+        -- ^ Partition the message was produced to.
+      , drBrokerId  :: {-# UNPACK #-} !Int32
+        -- ^ Node ID of the broker that accepted the message (-1 if unknown).
+      , drLatencyUs :: {-# UNPACK #-} !Int64
+        -- ^ End-to-end latency in microseconds (enqueue to delivery report).
+      , drTimestamp :: {-# UNPACK #-} !Int64
+        -- ^ Broker-assigned timestamp (logAppendTime), or -1 if unavailable.
+      }
+  | DeliveryFailure
+      { drRecord    :: !ProducerRecord
+      , drError     :: !ByteString
+      , drErrorCode :: {-# UNPACK #-} !Int16
+        -- ^ Kafka error code (0 if not a protocol error).
+      }
   deriving (Eq, Show)
 
 -- | Record header (KIP-82).

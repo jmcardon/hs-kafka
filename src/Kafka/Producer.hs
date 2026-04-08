@@ -176,16 +176,17 @@ withProducer client cfg action = mask $ \restore -> do
   case result of
     Left err -> pure (Left err)
     Right producer -> do
-      let cleanup = flushProducer producer >> closeProducer producer
+      let cleanup = closeProducer producer
       a <- restore (action producer) `onException` cleanup
       cleanup
       pure (Right a)
 
 -- | Close the producer. Currently a no-op since broker threads are
 -- owned by KafkaClient. Call closeClient to shut everything down.
+-- | Close the producer. Flushes all pending messages before returning,
+-- matching librdkafka's closeProducer = flushProducer semantics.
 closeProducer :: KafkaProducer -> IO ()
-closeProducer _producer = pure ()
--- Future: could drain pending messages, cancel poller thread, etc.
+closeProducer = flushProducer
 
 ------------------------------------------------------------------------
 -- Queue forwarding
@@ -264,8 +265,14 @@ sendRecordSync producer record var = do
                 , pmDeliveryQueue = drQueue
                 , pmRetriesLeft = ccRetries (kpConfig producer)
                 }
-          atomically $ writeTBQueue (beOps env) (BrokerProduce topic part pm)
-          pure (Right ())
+          accepted <- atomically $ do
+            full <- isFullTBQueue (beOps env)
+            if full
+              then pure False
+              else writeTBQueue (beOps env) (BrokerProduce topic part pm) >> pure True
+          if accepted
+            then pure (Right ())
+            else pure (Left KafkaQueueFullException)
 
 -- | Internal: async produce.
 sendRecord :: KafkaProducer -> ProducerRecord
@@ -295,8 +302,14 @@ sendRecord producer record mCb = do
                 , pmDeliveryQueue = drQueue
                 , pmRetriesLeft = ccRetries (kpConfig producer)
                 }
-          atomically $ writeTBQueue (beOps env) (BrokerProduce topic part pm)
-          pure (Right ())
+          accepted <- atomically $ do
+            full <- isFullTBQueue (beOps env)
+            if full
+              then pure False
+              else writeTBQueue (beOps env) (BrokerProduce topic part pm) >> pure True
+          if accepted
+            then pure (Right ())
+            else pure (Left KafkaQueueFullException)
 
 -- | Resolve which delivery queue to use: forwarded or default.
 resolveDeliveryQueue :: KafkaProducer -> IO (TBQueue DeliveryEntry)
@@ -330,25 +343,25 @@ pollEvents producer timeoutMs = do
 -- | Drain the queue with timeout semantics.
 drainWithTimeout :: TBQueue DeliveryEntry -> Int -> IO [DeliveryEntry]
 drainWithTimeout q timeoutMs = do
-  -- Non-blocking drain first
   immediate <- atomically $ flushTBQueue q
-  if not (null immediate)
-    then pure immediate
-    else if timeoutMs == 0
-      then pure []
-      else do
-        -- Block with timeout
-        timer <- if timeoutMs < 0
-          then newTVarIO False  -- never fires
-          else registerDelay (timeoutMs * 1000)
-        atomically $ do
-          timedOut <- readTVar timer
-          if timedOut
-            then pure []
-            else do
-              first <- readTBQueue q
-              rest <- flushTBQueue q
-              pure (first : rest)
+  case immediate of
+    (_:_) -> pure immediate
+    []    -> waitForEntries
+  where
+    waitForEntries
+      | timeoutMs == 0 = pure []
+      | otherwise = do
+          timer <- if timeoutMs < 0
+            then newTVarIO False
+            else registerDelay (timeoutMs * 1000)
+          atomically $ do
+            timedOut <- readTVar timer
+            if timedOut
+              then pure []
+              else do
+                first <- readTBQueue q
+                rest <- flushTBQueue q
+                pure (first : rest)
 
 -- | Invoke per-message callback + global callback, return the report.
 invokeCallbacks :: Maybe (DeliveryReport -> IO ()) -> DeliveryEntry -> IO DeliveryReport

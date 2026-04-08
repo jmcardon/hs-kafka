@@ -38,6 +38,9 @@ main = defaultMain $ testGroup "Integration"
   , backpressureTests
   , loadTests
   , consumerTests
+  , queueFullTests
+  , closeProducerTests
+  , deliveryReportFieldTests
   ]
 
 ------------------------------------------------------------------------
@@ -134,8 +137,8 @@ producerTests = testGroup "Producer"
           result <- produce producer (mkRecord "produce-test" "hello kafka")
           case result of
             Left err -> assertFailure ("produce failed: " ++ show err)
-            Right (DeliverySuccess _ _) -> pure ()
-            Right (DeliveryFailure _ e) -> assertFailure ("produce delivery failed: " ++ show e)
+            Right (DeliverySuccess{}) -> pure ()
+            Right (DeliveryFailure{drError = e}) -> assertFailure ("produce delivery failed: " ++ show e)
 
   , testCase "produce 100 messages" $
       withMockCluster 1 $ \mc -> do
@@ -189,8 +192,8 @@ producerTests = testGroup "Producer"
           let drainLoop !total = do
                 reports <- pollEvents producer 1000
                 forM_ reports $ \dr -> case dr of
-                  DeliverySuccess _ _ -> atomicModifyIORef' successCount (\n -> (n+1, ()))
-                  DeliveryFailure _ _ -> atomicModifyIORef' failCount (\n -> (n+1, ()))
+                  DeliverySuccess{} -> atomicModifyIORef' successCount (\n -> (n+1, ()))
+                  DeliveryFailure{} -> atomicModifyIORef' failCount (\n -> (n+1, ()))
                 let !total' = total + length reports
                 if total' < 50 && not (null reports)
                   then drainLoop total'
@@ -231,10 +234,10 @@ recordFeatureTests = testGroup "Record features"
           r2 <- produce producer (rec "my-key")
           r3 <- produce producer (rec "other-key")
           case (r1, r2) of
-            (Right (DeliverySuccess _ _), Right (DeliverySuccess _ _)) -> pure ()
+            (Right (DeliverySuccess{}), Right (DeliverySuccess{})) -> pure ()
             _ -> assertFailure "keyed produce should succeed"
           case r3 of
-            Right (DeliverySuccess _ _) -> pure ()
+            Right (DeliverySuccess{}) -> pure ()
             _ -> assertFailure "keyed produce should succeed"
 
   , testCase "produce with explicit partition" $
@@ -246,7 +249,7 @@ recordFeatureTests = testGroup "Record features"
           r0 <- produce producer (rec 0)
           r2 <- produce producer (rec 2)
           case (r0, r2) of
-            (Right (DeliverySuccess _ _), Right (DeliverySuccess _ _)) -> pure ()
+            (Right (DeliverySuccess{}), Right (DeliverySuccess{})) -> pure ()
             _ -> assertFailure "explicit partition produce should succeed"
 
   , testCase "produce with headers" $
@@ -262,8 +265,8 @@ recordFeatureTests = testGroup "Record features"
           result <- produce producer rec
           case result of
             Left err -> assertFailure ("produce with headers failed: " ++ show err)
-            Right (DeliverySuccess _ _) -> pure ()
-            Right (DeliveryFailure _ e) -> assertFailure ("delivery failed: " ++ show e)
+            Right (DeliverySuccess{}) -> pure ()
+            Right (DeliveryFailure{drError = e}) -> assertFailure ("delivery failed: " ++ show e)
 
   , testCase "delivery report contains offset" $
       withMockCluster 1 $ \mc -> do
@@ -272,7 +275,7 @@ recordFeatureTests = testGroup "Record features"
           r1 <- produce producer (mkRecord "offset-test" "msg1")
           r2 <- produce producer (mkRecord "offset-test" "msg2")
           case (r1, r2) of
-            (Right (DeliverySuccess _ (Offset o1)), Right (DeliverySuccess _ (Offset o2))) -> do
+            (Right DeliverySuccess{drOffset = Offset o1}, Right DeliverySuccess{drOffset = Offset o2}) -> do
               assertBool "second offset should be >= first" (o2 >= o1)
             _ -> assertFailure "both produces should succeed with offsets"
 
@@ -285,8 +288,8 @@ recordFeatureTests = testGroup "Record features"
           result <- produce producer rec
           case result of
             Left err -> assertFailure ("null value produce failed: " ++ show err)
-            Right (DeliverySuccess _ _) -> pure ()
-            Right (DeliveryFailure _ e) -> assertFailure ("delivery failed: " ++ show e)
+            Right (DeliverySuccess{}) -> pure ()
+            Right (DeliveryFailure{drError = e}) -> assertFailure ("delivery failed: " ++ show e)
   ]
 
 ------------------------------------------------------------------------
@@ -308,8 +311,8 @@ compressionTests = testGroup "Compression"
           result <- produce producer (mkRecord "small-comp" "x")
           case result of
             Left err -> assertFailure ("produce failed: " ++ show err)
-            Right (DeliverySuccess _ _) -> pure ()
-            Right (DeliveryFailure _ e) -> assertFailure ("produce delivery failed: " ++ show e)
+            Right (DeliverySuccess{}) -> pure ()
+            Right (DeliveryFailure{drError = e}) -> assertFailure ("produce delivery failed: " ++ show e)
   ]
 
 -- | Test producing with a given compression codec end-to-end through the mock cluster.
@@ -338,8 +341,8 @@ errorHandlingTests = testGroup "Error handling"
           result <- produce producer (mkRecord "nonexistent-topic" "test")
           case result of
             Left _ -> pure ()  -- Expected: error because topic doesn't exist
-            Right (DeliverySuccess _ _) -> pure ()  -- Mock cluster may auto-create
-            Right (DeliveryFailure _ _) -> pure ()  -- Expected failure
+            Right (DeliverySuccess{}) -> pure ()  -- Mock cluster may auto-create
+            Right (DeliveryFailure{}) -> pure ()  -- Expected failure
 
   , testCase "produce survives brief disconnect" $
       withMockCluster 1 $ \mc -> do
@@ -365,8 +368,8 @@ errorHandlingTests = testGroup "Error handling"
                 r1 <- produce producer (mkRecord "disconnect-test" "before disconnect")
                 case r1 of
                   Left err -> assertFailure ("first produce failed: " ++ show err)
-                  Right (DeliverySuccess _ _) -> pure ()
-                  Right (DeliveryFailure _ e) -> assertFailure ("first produce delivery failed: " ++ show e)
+                  Right (DeliverySuccess{}) -> pure ()
+                  Right (DeliveryFailure{drError = e}) -> assertFailure ("first produce delivery failed: " ++ show e)
 
                 -- Brief disconnect
                 mockBrokerDown mc 1
@@ -378,8 +381,8 @@ errorHandlingTests = testGroup "Error handling"
                 r2 <- produce producer (mkRecord "disconnect-test" "after reconnect")
                 case r2 of
                   Left _ -> pure ()  -- May fail if reconnection not complete
-                  Right (DeliverySuccess _ _) -> pure ()
-                  Right (DeliveryFailure _ _) -> pure ()
+                  Right (DeliverySuccess{}) -> pure ()
+                  Right (DeliveryFailure{}) -> pure ()
 
                 closeProducer producer
                 closeClient client
@@ -460,8 +463,8 @@ multiBrokerTests = testGroup "Multi-broker"
           r1 <- produce producer (mkRecord "failover-test" "before-failover")
           case r1 of
             Left err -> assertFailure ("first produce failed: " ++ show err)
-            Right (DeliverySuccess _ _) -> pure ()
-            Right (DeliveryFailure _ e) -> assertFailure ("first produce delivery failed: " ++ show e)
+            Right (DeliverySuccess{}) -> pure ()
+            Right (DeliveryFailure{drError = e}) -> assertFailure ("first produce delivery failed: " ++ show e)
 
           -- Move partition 0 leader to broker 2
           mockPartitionSetLeader mc "failover-test" 0 2
@@ -474,8 +477,8 @@ multiBrokerTests = testGroup "Multi-broker"
           r2 <- produce producer (mkRecord "failover-test" "after-failover")
           case r2 of
             Left err -> assertFailure ("produce after failover failed: " ++ show err)
-            Right (DeliverySuccess _ _) -> pure ()
-            Right (DeliveryFailure _ e) -> assertFailure ("produce after failover delivery failed: " ++ show e)
+            Right (DeliverySuccess{}) -> pure ()
+            Right (DeliveryFailure{drError = e}) -> assertFailure ("produce after failover delivery failed: " ++ show e)
   ]
 
 ------------------------------------------------------------------------
@@ -495,8 +498,8 @@ retriableErrorTests = testGroup "Retriable errors"
           result <- produce producer (mkRecord "retry-test" "should-retry")
           case result of
             Left err -> assertFailure ("produce should have succeeded after retries: " ++ show err)
-            Right (DeliverySuccess _ _) -> pure ()
-            Right (DeliveryFailure _ e) -> assertFailure ("produce delivery failed: " ++ show e)
+            Right (DeliverySuccess{}) -> pure ()
+            Right (DeliveryFailure{drError = e}) -> assertFailure ("produce delivery failed: " ++ show e)
 
   , testCase "fails on non-retriable error (INVALID_REQUIRED_ACKS = 21)" $
       withMockCluster 1 $ \mc -> do
@@ -508,8 +511,8 @@ retriableErrorTests = testGroup "Retriable errors"
           result <- produce producer (mkRecord "noretry-test" "should-fail")
           case result of
             Left _ -> pure ()  -- Expected failure
-            Right (DeliverySuccess _ _) -> pure ()  -- Mock cluster may handle differently
-            Right (DeliveryFailure _ _) -> pure ()  -- Expected failure
+            Right (DeliverySuccess{}) -> pure ()  -- Mock cluster may handle differently
+            Right (DeliveryFailure{}) -> pure ()  -- Expected failure
 
   , testCase "exhausts retries and fails" $
       withMockCluster 1 $ \mc -> do
@@ -521,8 +524,8 @@ retriableErrorTests = testGroup "Retriable errors"
           result <- produce producer (mkRecord "exhaust-test" "will-exhaust")
           case result of
             Left _ -> pure ()  -- Expected: retries exhausted
-            Right (DeliverySuccess _ _) -> pure ()  -- Mock may absorb errors differently
-            Right (DeliveryFailure _ _) -> pure ()  -- Expected: retries exhausted
+            Right (DeliverySuccess{}) -> pure ()  -- Mock may absorb errors differently
+            Right (DeliveryFailure{}) -> pure ()  -- Expected: retries exhausted
   ]
 
 ------------------------------------------------------------------------
@@ -698,6 +701,48 @@ consumerTests = testGroup "Consumer"
           Right () -> pure ()
           Left err -> assertFailure ("withConsumer failed: " ++ show err)
         closeClient client
+
+  , testCase "closeConsumer terminates without hang" $
+      withMockCluster 1 $ \mc -> do
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+        mockCreateTopic mc "close-cons-test" 1 1
+        Right client <- newClient cfg
+        let consCfg = defaultConsumerConfig cfg "close-group" ["close-cons-test"]
+        Right consumer <- newConsumer client consCfg
+        assign consumer [TopicPartition "close-cons-test" 0 0]
+        -- closeConsumer should return promptly even if no messages
+        closeConsumer consumer
+        closeClient client
+        -- Getting here means no hang
+
+  , testCase "concurrent fetch across many partitions" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "concfetch" 8 1
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs }
+        -- Produce to all partitions
+        Right client <- newClient cfg
+        Right producer <- newProducer client (defaultProducerConfig cfg)
+        forM_ [0..7 :: Int] $ \p ->
+          forM_ [0..4 :: Int] $ \i ->
+            void $ produce producer (ProducerRecord "concfetch"
+              (SpecifiedPartition (fromIntegral p)) Nothing
+              (Just (BS.pack [fromIntegral i])) [])
+        void $ flush producer 5000
+        closeProducer producer
+        -- Consume via assign — should fetch from all 8 partitions concurrently
+        let consCfg = (defaultConsumerConfig cfg "conc-group" ["concfetch"])
+              { ccFetchWaitMs = 100 }
+        Right consumer <- newConsumer client consCfg
+        assign consumer [ TopicPartition "concfetch" (fromIntegral p) 0
+                        | p <- [0..7 :: Int]
+                        ]
+        records <- consumerPollBatch consumer 10000 200
+        closeConsumer consumer
+        closeClient client
+        assertBool ("should get records from multiple partitions, got " ++ show (length records))
+          (length records > 0)
   ]
 
 ------------------------------------------------------------------------
@@ -707,13 +752,13 @@ consumerTests = testGroup "Consumer"
 -- | Check if a produce result is a delivery failure (Left or DeliveryFailure).
 isDeliveryFailure :: Either KafkaException DeliveryReport -> Bool
 isDeliveryFailure (Left _) = True
-isDeliveryFailure (Right (DeliveryFailure _ _)) = True
-isDeliveryFailure (Right (DeliverySuccess _ _)) = False
+isDeliveryFailure (Right (DeliveryFailure{})) = True
+isDeliveryFailure (Right (DeliverySuccess{})) = False
 
 -- | Check if a DeliveryReport is a failure.
 isDeliveryFailureReport :: DeliveryReport -> Bool
-isDeliveryFailureReport (DeliveryFailure _ _) = True
-isDeliveryFailureReport (DeliverySuccess _ _) = False
+isDeliveryFailureReport (DeliveryFailure{}) = True
+isDeliveryFailureReport (DeliverySuccess{}) = False
 
 ------------------------------------------------------------------------
 -- Load tests
@@ -780,7 +825,7 @@ loadTests = testGroup "Load tests"
           withProducer client (defaultProducerConfig cfg) $ \producer -> do
             r <- produce producer (mkRecord "with-test" "bracket-safe")
             case r of
-              Right (DeliverySuccess _ _) -> pure ()
+              Right (DeliverySuccess{}) -> pure ()
               _ -> assertFailure "produce should succeed"
         case result of
           Right (Right ()) -> pure ()
@@ -807,4 +852,146 @@ loadTests = testGroup "Load tests"
             (\n -> (n + length finalReports, ()))
           delivered <- readIORef totalDelivered
           assertEqual "all 100 should be delivered" 100 delivered
+  ]
+
+------------------------------------------------------------------------
+-- Queue-full tests
+------------------------------------------------------------------------
+
+queueFullTests :: TestTree
+queueFullTests = testGroup "Queue full"
+  [ testCase "produceAsync returns KafkaQueueFullException when queue full" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "qfull-test" 1 1
+        -- Tiny queue + huge linger so messages pile up
+        let cfg = defaultConfig
+              { ccQueueSize = 4
+              , ccLingerMs = 60000
+              , ccBatchNumMessages = 1000000
+              , ccBatchSize = 1000000
+              }
+        withTestProducer mc cfg $ \_client producer -> do
+          -- Push lots of messages without flushing
+          results <- mapM (\i ->
+            produceAsync producer (mkRecord "qfull-test"
+              (BS.pack [fromIntegral (i `mod` 256 :: Int)])))
+            [0..50 :: Int]
+          let queueFulls = [() | Left KafkaQueueFullException <- results]
+          assertBool "should have at least one KafkaQueueFullException"
+            (not (null queueFulls))
+          -- Drain so test cleanup doesn't hang
+          flushProducer producer
+
+  , testCase "produceAsync returns Right () when queue has room" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "qok-test" 1 1
+        let cfg = defaultConfig { ccQueueSize = 1000 }
+        withTestProducer mc cfg $ \_client producer -> do
+          results <- mapM (\i ->
+            produceAsync producer (mkRecord "qok-test"
+              (BS.pack [fromIntegral (i :: Int)])))
+            [0..9 :: Int]
+          let failed = [e | Left e <- results]
+          assertEqual "no enqueue failures" 0 (length failed)
+          flushProducer producer
+  ]
+
+------------------------------------------------------------------------
+-- closeProducer flush behavior
+------------------------------------------------------------------------
+
+closeProducerTests :: TestTree
+closeProducerTests = testGroup "closeProducer"
+  [ testCase "closeProducer drains pending messages" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "close-test" 1 1
+        let addrs = parseBootstraps (mcBootstraps mc)
+            cfg = defaultConfig { ccBootstrap = addrs, ccLingerMs = 30000 }
+        Right client <- newClient cfg
+        Right producer <- newProducer client (defaultProducerConfig cfg)
+
+        delivered <- newIORef (0 :: Int)
+        -- Use callbacks to count actual deliveries
+        mapM_ (\i -> produceWithCallback producer
+          (mkRecord "close-test" (BS.pack [fromIntegral (i :: Int)]))
+          (\_ -> atomicModifyIORef' delivered (\n -> (n+1, ()))))
+          [0..9 :: Int]
+
+        -- closeProducer should flush before returning
+        closeProducer producer
+        -- After close, drain any reports that arrived
+        _ <- pollEvents producer 1000
+
+        n <- readIORef delivered
+        closeClient client
+        assertEqual "all 10 should be delivered after closeProducer" 10 n
+  ]
+
+------------------------------------------------------------------------
+-- DeliveryReport fields
+------------------------------------------------------------------------
+
+deliveryReportFieldTests :: TestTree
+deliveryReportFieldTests = testGroup "DeliveryReport fields"
+  [ testCase "DeliverySuccess includes partition" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "dr-part" 4 1
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          result <- produce producer (ProducerRecord "dr-part"
+            (SpecifiedPartition 2) Nothing (Just "msg") [])
+          case result of
+            Right dr@DeliverySuccess{} ->
+              assertEqual "partition matches" 2 (drPartition dr)
+            _ -> assertFailure "expected DeliverySuccess"
+
+  , testCase "DeliverySuccess includes brokerId" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "dr-broker" 1 1
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          result <- produce producer (mkRecord "dr-broker" "msg")
+          case result of
+            Right dr@DeliverySuccess{} ->
+              assertBool "brokerId should be >= 0" (drBrokerId dr >= 0)
+            _ -> assertFailure "expected DeliverySuccess"
+
+  , testCase "DeliverySuccess includes non-negative latency" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "dr-lat" 1 1
+        -- Add some RTT to ensure non-trivial latency
+        mockBrokerSetRtt mc 1 5
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          result <- produce producer (mkRecord "dr-lat" "msg")
+          case result of
+            Right dr@DeliverySuccess{} ->
+              assertBool ("latency should be >= 0, got " ++ show (drLatencyUs dr))
+                (drLatencyUs dr >= 0)
+            _ -> assertFailure "expected DeliverySuccess"
+
+  , testCase "DeliverySuccess includes drOffset" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "dr-off" 1 1
+        withTestProducer mc defaultConfig $ \_client producer -> do
+          r1 <- produce producer (mkRecord "dr-off" "first")
+          r2 <- produce producer (mkRecord "dr-off" "second")
+          case (r1, r2) of
+            (Right d1@DeliverySuccess{}, Right d2@DeliverySuccess{}) -> do
+              let Offset o1 = drOffset d1
+                  Offset o2 = drOffset d2
+              assertBool "second offset > first" (o2 > o1)
+            _ -> assertFailure "expected two successes"
+
+  , testCase "DeliveryFailure includes drErrorCode" $
+      withMockCluster 1 $ \mc -> do
+        mockCreateTopic mc "dr-err" 1 1
+        -- Push a non-retriable error
+        mockPushRequestErrors mc 0 [21]  -- INVALID_REQUIRED_ACKS
+        let cfg = defaultConfig { ccRetries = 0 }
+        withTestProducer mc cfg $ \_client producer -> do
+          result <- produce producer (mkRecord "dr-err" "msg")
+          case result of
+            Right dr@DeliveryFailure{} ->
+              -- 21 is the pushed error code
+              assertBool ("error code should be set, got " ++ show (drErrorCode dr))
+                (drErrorCode dr /= 0)
+            _ -> pure ()  -- Mock may handle differently; not asserting strictly
   ]

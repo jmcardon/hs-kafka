@@ -41,6 +41,7 @@ module Kafka.Consumer.New
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.Async (Async, async, cancel)
 import Control.Concurrent.STM
 import Control.Exception (mask, onException)
 import Control.Monad (void, unless, when, forM_)
@@ -60,6 +61,7 @@ import Kafka.Internal.Config
 import Kafka.Internal.FindCoordinator.Request (findCoordinatorRequest)
 import Kafka.Internal.FindCoordinator.Response (parseFindCoordinatorResponse)
 import Kafka.Internal.JoinGroup.Request (joinGroupRequest)
+import Kafka.Internal.LeaveGroup.Request (leaveGroupRequest)
 import Kafka.Internal.SyncGroup.Request (syncGroupRequest)
 import Kafka.Internal.Heartbeat.Request (heartbeatRequest)
 import Kafka.Internal.Fetch.Request (sessionlessFetchRequest)
@@ -68,6 +70,7 @@ import Kafka.Consumer.Types
 import Kafka.Producer.Types (Header(..))
 import qualified Kafka.Internal.Wire as Wire
 import qualified Kafka.Internal.JoinGroup.Response as J
+import qualified Kafka.Internal.LeaveGroup.Response as LG
 import qualified Kafka.Internal.SyncGroup.Response as S
 import qualified Kafka.Internal.Heartbeat.Response as H
 import qualified Kafka.Internal.Fetch.Response as F
@@ -92,7 +95,8 @@ newConsumer client cfg = do
     , cgsCommitted = Map.empty
     }
   modeVar <- newTVarIO ModeSubscribe
-  let consumer = KafkaConsumer client cfg stateVar fetchQ shutdownVar pausedVar modeVar
+  hbVar <- newTVarIO Nothing
+  let consumer = KafkaConsumer client cfg stateVar fetchQ shutdownVar pausedVar modeVar hbVar
 
   forM_ (ccTopics cfg) $ \topic ->
     refreshTopicMetadata client topic
@@ -121,6 +125,15 @@ closeConsumer consumer = do
   state <- readTVarIO (consGroupState consumer)
   when (ccAutoCommit (consConfig consumer) && not (Map.null (cgsOffsets state))) $
     void $ commitSync consumer
+
+  -- Send LeaveGroup so the broker doesn't wait for session timeout
+  mode <- readTVarIO (consMode consumer)
+  when (mode == ModeSubscribe && cgsJoinState state == JoinSteady) $
+    sendLeaveGroup consumer
+
+  -- Cancel heartbeat thread if running
+  cancelHeartbeat consumer
+
   atomically $ writeTVar (consShutdown consumer) True
 
 ------------------------------------------------------------------------
@@ -139,22 +152,24 @@ consumerPoll consumer timeoutMs = do
 consumerPollBatch :: KafkaConsumer -> Int -> Int -> IO [ConsumerRecord]
 consumerPollBatch consumer timeoutMs maxRecords = do
   immediate <- atomically $ flushTBQueue (consFetchQueue consumer)
-  if not (null immediate)
-    then pure (take maxRecords immediate)
-    else if timeoutMs == 0
-      then pure []
-      else do
-        timer <- if timeoutMs < 0
-          then newTVarIO False
-          else registerDelay (timeoutMs * 1000)
-        atomically $ do
-          timedOut <- readTVar timer
-          if timedOut
-            then pure []
-            else do
-              first <- readTBQueue (consFetchQueue consumer)
-              rest <- flushTBQueue (consFetchQueue consumer)
-              pure (take maxRecords (first : rest))
+  case immediate of
+    (_:_) -> pure (take maxRecords immediate)
+    []    -> waitForRecords
+  where
+    waitForRecords
+      | timeoutMs == 0 = pure []
+      | otherwise = do
+          timer <- if timeoutMs < 0
+            then newTVarIO False
+            else registerDelay (timeoutMs * 1000)
+          atomically $ do
+            timedOut <- readTVar timer
+            if timedOut
+              then pure []
+              else do
+                first <- readTBQueue (consFetchQueue consumer)
+                rest <- flushTBQueue (consFetchQueue consumer)
+                pure (take maxRecords (first : rest))
 
 ------------------------------------------------------------------------
 -- Offset management
@@ -218,6 +233,7 @@ doCommit consumer offsets = do
             s { cgsCommitted = Map.union offsets (cgsCommitted s) }
           pure (Right ())
         (e:_) -> pure (Left e)
+
 ------------------------------------------------------------------------
 -- Assignment / subscription
 ------------------------------------------------------------------------
@@ -297,11 +313,36 @@ consumerGroupThread consumer = do
             threadDelay 1000000
             consumerGroupThread consumer
           Right () -> do
-            _ <- forkIO $ heartbeatThread consumer
+            startHeartbeat consumer
             fetchLoop consumer
+            -- Fetch loop exited — revoke partitions before re-joining
+            state <- readTVarIO (consGroupState consumer)
+            traverse_ ($ PartitionsRevoked (cgsAssignment state))
+                      (ccRebalanceCallback (consConfig consumer))
+            cancelHeartbeat consumer
             atomically $ modifyTVar' (consGroupState consumer) $ \s ->
               s { cgsJoinState = JoinInit }
             consumerGroupThread consumer
+
+------------------------------------------------------------------------
+-- Heartbeat management
+------------------------------------------------------------------------
+
+-- | Start a heartbeat thread, cancelling any existing one first.
+startHeartbeat :: KafkaConsumer -> IO ()
+startHeartbeat consumer = do
+  cancelHeartbeat consumer
+  hb <- async (heartbeatThread consumer)
+  atomically $ writeTVar (consHeartbeat consumer) (Just hb)
+
+-- | Cancel the heartbeat thread if running.
+cancelHeartbeat :: KafkaConsumer -> IO ()
+cancelHeartbeat consumer = do
+  mHb <- atomically $ do
+    hb <- readTVar (consHeartbeat consumer)
+    writeTVar (consHeartbeat consumer) Nothing
+    pure hb
+  traverse_ cancel mHb
 
 ------------------------------------------------------------------------
 -- Join group
@@ -381,31 +422,40 @@ fetchLoop consumer = do
         activeParts = filter (\tp -> Set.notMember (tpTopic tp, tpPartition tp) paused)
                              (cgsAssignment state)
         offsets = cgsOffsets state
-    forM_ activeParts $ \tp -> do
+
+    -- Fire all fetch requests concurrently, then collect results
+    respVars <- mapM (\tp -> do
       let currentOff = Map.findWithDefault 0 (tpTopic tp, tpPartition tp) offsets
       mBroker <- leaderBrokerFor (consClient consumer) (tpTopic tp) (tpPartition tp)
       case mBroker of
-        Nothing -> pure ()
+        Nothing -> pure Nothing
         Just env -> do
           let fetchReq = sessionlessFetchRequest
                 (ccFetchWaitMs cfg) (tpTopic tp)
                 [PartitionOffset (tpPartition tp) currentOff]
                 (ccFetchMaxBytes cfg)
           respVar <- enqueueRequest env fetchReq
-          response <- atomically $ readTMVar respVar
-          case response of
-            Left _err -> pure ()  -- Broker error — will retry next cycle
-            Right bytes -> case Wire.runWire F.parseFetchResponse bytes of
-              Nothing -> pure ()  -- Parse error — will retry next cycle
-              Just fetchResp -> do
-                let records = extractRecords (tpTopic tp) fetchResp
-                    maxOff = if null records then currentOff
-                             else maximum (map crOffset records) + 1
-                -- Enqueue records + update offset in one transaction
-                atomically $ do
-                  forM_ records $ writeTBQueue (consFetchQueue consumer)
-                  modifyTVar' (consGroupState consumer) $ \s ->
-                    s { cgsOffsets = Map.insert (tpTopic tp, tpPartition tp) maxOff (cgsOffsets s) }
+          pure (Just (tp, currentOff, respVar))
+      ) activeParts
+
+    -- Collect all responses
+    forM_ respVars $ \case
+      Nothing -> pure ()
+      Just (tp, currentOff, respVar) -> do
+        response <- atomically $ readTMVar respVar
+        case response of
+          Left _err -> pure ()
+          Right bytes -> case Wire.runWire F.parseFetchResponse bytes of
+            Nothing -> pure ()
+            Just fetchResp -> do
+              let records = extractRecords (tpTopic tp) fetchResp
+                  maxOff = if null records then currentOff
+                           else maximum (map crOffset records) + 1
+              atomically $ do
+                forM_ records $ writeTBQueue (consFetchQueue consumer)
+                modifyTVar' (consGroupState consumer) $ \s ->
+                  s { cgsOffsets = Map.insert (tpTopic tp, tpPartition tp) maxOff (cgsOffsets s) }
+
     threadDelay (ccFetchWaitMs cfg * 1000)
     fetchLoop consumer
 
@@ -427,6 +477,29 @@ extractRecords topicFilter resp =
   , rb <- batches
   , r <- F.records rb
   ]
+
+------------------------------------------------------------------------
+-- LeaveGroup
+------------------------------------------------------------------------
+
+-- | Send LeaveGroup to the coordinator so rebalance happens immediately
+-- instead of waiting for session timeout.
+sendLeaveGroup :: KafkaConsumer -> IO ()
+sendLeaveGroup consumer = do
+  state <- readTVarIO (consGroupState consumer)
+  let cfg = consConfig consumer
+      member = GroupMember (ccGroupId cfg) (cgsMemberId state)
+  mBroker <- anyBroker (consClient consumer)
+  traverse_ (\env -> do
+    let reqBytes = leaveGroupRequest member
+    respVar <- enqueueRequest env reqBytes
+    response <- atomically $ readTMVar respVar
+    case response of
+      Left _ -> pure ()
+      Right bytes -> case Wire.runWire LG.parseLeaveGroupResponse bytes of
+        Nothing -> pure ()
+        Just _resp -> pure ()
+    ) mBroker
 
 ------------------------------------------------------------------------
 -- Heartbeat thread

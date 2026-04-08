@@ -38,6 +38,7 @@ import qualified Data.Map.Strict as Map
 import Kafka.Common
 import Kafka.Internal.Broker
 import Kafka.Internal.Config
+import Kafka.Producer.Types (DeliveryReport(..))
 import Kafka.Internal.Metadata.Request (metadataRequest)
 import Kafka.Internal.Metadata.Response (MetadataResponse(..), MetadataBroker(..), MetadataTopic(..), MetadataPartition(..), parseMetadataResponseV12)
 import qualified Kafka.Internal.Metadata.Response as M
@@ -91,8 +92,9 @@ newClient cfg = case ccBootstrap cfg of
     -- real node IDs until metadata response.
     envs <- sequence
       [ do env <- newBrokerEnv cfg (fromIntegral i) peer
-           startBrokerThread env
-           pure (fromIntegral i :: Int, env)
+           let env' = env { beOnRetry = retryViaClient client }
+           startBrokerThread env'
+           pure (fromIntegral i :: Int, env')
       | (i, peer) <- zip [(0::Int)..] peers
       ]
 
@@ -253,9 +255,10 @@ updateMetadataCache client resp = do
   forM_ newBrokers $ \mb -> do
     let addr = BrokerAddress (BS8.unpack (M.host mb)) (fromIntegral (M.port mb))
     env <- newBrokerEnv cfg (M.nodeId mb) addr
-    startBrokerThread env
+    let env' = env { beOnRetry = retryViaClient client }
+    startBrokerThread env'
     atomically $ modifyTVar' (kcBrokers client) $
-      IM.insert (fromIntegral (M.nodeId mb)) env
+      IM.insert (fromIntegral (M.nodeId mb)) env'
   where
     brokerAddrKey :: BrokerAddress -> (String, Int)
     brokerAddrKey (BrokerAddress h p) = (h, fromIntegral p)
@@ -265,6 +268,23 @@ updateMetadataCache client resp = do
 ------------------------------------------------------------------------
 -- Internal helpers
 ------------------------------------------------------------------------
+
+-- | Retry callback for broker threads. On retriable leader errors
+-- (NotLeaderForPartition etc.), refreshes metadata for the topic
+-- and re-enqueues the message to the new leader broker.
+-- Falls back to any available broker if leader lookup fails.
+--
+-- IMPORTANT: This is called from the broker's receiver thread. Metadata
+-- refresh is a blocking request that needs to flow through the broker's
+-- own receiver, so we MUST fork a worker to avoid deadlock.
+retryViaClient :: KafkaClient -> TopicName -> Int32 -> PendingMessage -> IO ()
+retryViaClient client topic part msg = void $ forkIO $ do
+  -- Refresh metadata so we route to the new leader
+  _ <- refreshTopicMetadata client topic
+  mBroker <- leaderBrokerFor client topic part
+  case mBroker of
+    Just env -> atomically $ writeTBQueue (beOps env) (BrokerProduce topic part msg)
+    Nothing  -> deliverReportIO msg (DeliveryFailure (pmRecord msg) "no broker available after metadata refresh" 0)
 
 -- | Periodic metadata refresh loop. Refreshes metadata for all known
 -- topics at the configured interval. Stops when kcShutdown is set.

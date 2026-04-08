@@ -31,7 +31,7 @@ module Kafka.Consumer
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, registerDelay)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
 import Control.Monad hiding (join)
 import Control.Monad.Except
 import Control.Monad.Reader
@@ -172,8 +172,7 @@ getListedOffsets allIndices = do
   ConsumerState {..} <- getv
   let ConsumerSettings {..} = settings
   liftConsumer $ listOffsets kafka (ListOffsetsRequest csTopicName allIndices groupFetchStart) handle
-  listOffsetsTimeout <- liftIO (registerDelay timeout)
-  listedOffs <- liftConsumer $ parseResponse L.parseListOffsetsResponse kafka listOffsetsTimeout
+  listedOffs <- liftConsumer $ parseResponse L.parseListOffsetsResponse kafka timeout
   let lots = L.topics listedOffs
   let errs = case List.find ((== csTopicName) . L.topic) lots of
         Nothing -> []
@@ -302,8 +301,7 @@ sendHeartbeat = do
   ConsumerState {sock, member, genId, kafka, settings} <- getv
   withSocket sock $ do
     liftConsumer $ heartbeat kafka (HeartbeatRequest member genId) (handle settings)
-    timeout <- liftIO $ registerDelay (timeout settings)
-    resp <- liftConsumer $ parseResponse H.parseHeartbeatResponse kafka timeout
+    resp <- liftConsumer $ parseResponse H.parseHeartbeatResponse kafka (timeout settings)
     case fromErrorCode (H.errorCode resp) of
       Nothing -> pure ()
       Just None -> pure ()
@@ -315,8 +313,7 @@ leave = do
   ConsumerState {..} <- getv
   withSocket sock $ do
     liftConsumer $ leaveGroup kafka (LeaveGroupRequest member) (handle settings)
-    timeout <- liftIO $ registerDelay (timeout settings)
-    resp <- liftConsumer $ parseResponse LeaveGroup.parseLeaveGroupResponse kafka timeout
+    resp <- liftConsumer $ parseResponse LeaveGroup.parseLeaveGroupResponse kafka (timeout settings)
     case fromErrorCode (LeaveGroup.errorCode resp) of
       Nothing -> modifyv (\s -> s { quit = Interrupted })
       Just None -> modifyv (\s -> s { quit = Interrupted })
@@ -334,8 +331,7 @@ getRecordSet fetchWaitTime = do
       kafka
       (FetchRequest csTopicName fetchWaitTime offsetList maxFetchBytes)
       handle
-    interrupt <- liftIO $ registerDelay timeout
-    fetchResp <- liftConsumer $ parseResponse F.parseFetchResponse kafka interrupt
+    fetchResp <- liftConsumer $ parseResponse F.parseFetchResponse kafka timeout
     let errs = fetchResponseErrors fetchResp
     let newOffsets = updateOffsets csTopicName offsets fetchResp
     modifyv (\s -> s { offsets = newOffsets })
@@ -354,8 +350,7 @@ jumpToLatestOffset index = do
   ConsumerState {..} <- getv
   let ConsumerSettings {..} = settings
   liftConsumer $ listOffsets kafka (ListOffsetsRequest csTopicName [index] Latest) handle
-  listOffsetsTimeout <- liftIO (registerDelay timeout)
-  resp <- liftConsumer $ parseResponse L.parseListOffsetsResponse kafka listOffsetsTimeout
+  resp <- liftConsumer $ parseResponse L.parseListOffsetsResponse kafka timeout
   let listedOffs = listOffsetsMap resp
   -- Right biased union, because we want to jump to the offset in the right map
   modifyv (\s -> s { offsets = IM.unionWith (\_ y -> y) offsets listedOffs })
@@ -407,8 +402,7 @@ latestOffsets indices = do
     kafka
     (OffsetFetchRequest (csTopicName settings) member indices)
     (handle settings)
-  timeout <- liftIO $ registerDelay (timeout settings)
-  offs <- liftConsumer $ parseResponse O.parseOffsetFetchResponse kafka timeout
+  offs <- liftConsumer $ parseResponse O.parseOffsetFetchResponse kafka (timeout settings)
   case fromErrorCode (O.errorCode offs) of
     Nothing -> pure (offsetFetchOffsets offs)
     Just None -> pure (offsetFetchOffsets offs)
@@ -427,8 +421,7 @@ commitOffsets' cs = do
     kafka
     (OffsetCommitRequest csTopicName (toOffsetList offsets) member genId)
     handle
-  timeoutV <- liftIO $ registerDelay timeout
-  resp <- liftConsumer $ parseResponse C.parseOffsetCommitResponse kafka timeoutV
+  resp <- liftConsumer $ parseResponse C.parseOffsetCommitResponse kafka timeout
   let tops = C.topics resp
   let errs = case List.find ((== csTopicName) . C.topic) tops of
         Nothing -> []
@@ -509,8 +502,7 @@ sync kafka topicName partitionCount member members genId handle = do
     kafka
     (SyncGroupRequest member genId assignments)
     handle
-  wait <- liftIO (registerDelay joinTimeout)
-  sgr <- ExceptT $ parseResponse S.parseSyncGroupResponse kafka wait
+  sgr <- ExceptT $ parseResponse S.parseSyncGroupResponse kafka joinTimeout
   if S.errorCode sgr `elem` expectedSyncErrors then do
     (newGenId, newMember, newMembers) <- join kafka topicName member handle
     sync kafka topicName partitionCount newMember newMembers newGenId handle
@@ -531,15 +523,14 @@ join kafka top member@(GroupMember name@(GroupName gid) _) handle = do
     kafka
     (FindCoordinatorRequest gid 0)
     handle
-  wait <- liftIO (registerDelay joinTimeout)
   -- Ignoring the response from FindCoordinator. Probably not
   -- a good idea.
-  _ <- ExceptT $ parseResponse parseFindCoordinatorResponse kafka wait
+  _ <- ExceptT $ parseResponse parseFindCoordinatorResponse kafka joinTimeout
   ExceptT $ joinGroup
     kafka
     (JoinGroupRequest top member)
     handle
-  jgr <- ExceptT $ parseResponse J.parseJoinGroupResponse kafka wait
+  jgr <- ExceptT $ parseResponse J.parseJoinGroupResponse kafka joinTimeout
   let no_error_join = do
         let genId = GenerationId (J.generationId jgr)
         let memId = Just (J.memberId jgr)
